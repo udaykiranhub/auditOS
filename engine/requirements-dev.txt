@@ -1,0 +1,11 @@
+# AuditOS backend — development dependencies
+# Install:  pip install -r requirements.txt -r requirements-dev.txt
+
+-r requirements.txt
+
+pytest                  # golden-file / snapshot tests for the deterministic core (§9.4, §12.3)
+pytest-asyncio          # async agent/orchestrator tests
+syrupy                  # snapshot assertions for golden/ artifacts
+ruff                    # linter + formatter (fast)
+mypy                    # static typing for the slow-moving core
+respx                   # mock httpx (LLM calls) in tests without hitting the network

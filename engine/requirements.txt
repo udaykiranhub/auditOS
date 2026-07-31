@@ -1,0 +1,43 @@
+# AuditOS backend — runtime dependencies (SPEC §4 Technology Stack)
+# Python 3.11+  (you are on 3.13). Install into engine/.venv.
+
+# ── Web / API ──────────────────────────────────────────────────────────────
+fastapi                     # async API framework (§4)
+uvicorn[standard]           # ASGI server (adds websockets/httptools for SSE)
+python-multipart            # required for ZIP file uploads (§9)
+sse-starlette               # Server-Sent Events for the progress stream (api/stream.py)
+
+# ── Validation / models ────────────────────────────────────────────────────
+pydantic>=2                 # every artifact is a Pydantic v2 model — non-negotiable (§4, §7.1)
+pydantic-settings           # typed settings from .env
+
+# ── Async / IO ─────────────────────────────────────────────────────────────
+httpx                       # async HTTP (LLM calls, git-less fetches) (§4)
+aiofiles                    # async file IO for the artifact cache
+python-dotenv               # load ANTHROPIC_API_KEY / OPENAI_API_KEY from .env
+
+# ── Ingest / VCS ───────────────────────────────────────────────────────────
+gitpython                   # clone git URLs → RepoModel (§9.1)
+
+# ── Parsing (§12) ──────────────────────────────────────────────────────────
+# NOTE: use tree-sitter-language-pack (bundles a correctly-matched Solidity
+# grammar via PyCapsule). The standalone `tree-sitter-solidity` wheel returns a
+# raw int pointer whose ABI mismatches the tree-sitter core on Windows.
+# Import with:  from tree_sitter_language_pack import get_parser
+tree-sitter                 # error-tolerant parser core — PRIMARY structure source
+tree-sitter-language-pack   # bundled Solidity grammar + matched binding
+
+# ── Graphs (§13) ───────────────────────────────────────────────────────────
+networkx                    # the four graphs; adequate to ~5k nodes — do NOT use a graph DB
+
+# ── LLM providers (§4) — imported ONLY under engine/llm/ ───────────────────
+anthropic                   # Claude API — PRIMARY
+openai                      # OpenAI — fallback / second opinion
+
+# ── Static analysis (§11) — adapters, not dependencies ─────────────────────
+slither-analyzer            # Slither (primary). Requires a working solc/compilation.
+solc-select                 # manage solc versions for the RAW/direct-solc build path (§10.1)
+
+# ── CLI / logging ──────────────────────────────────────────────────────────
+rich                        # structured, readable CLI logs (§4)
+typer                       # CLI entrypoint (the engine must run without the frontend, §4)
