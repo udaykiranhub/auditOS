@@ -127,11 +127,38 @@ run directory; see [.env.example](.env.example) for the full list. Keys are read
 
 ## Running
 
-```bash
-# Backend API — http://localhost:8000
-cd engine && uvicorn api.routes:app --reload --port 8000
+The engine is a CLI first. Today one stage is implemented — the Repository Reader:
 
-# Frontend — http://localhost:5173, proxies /audits → localhost:8000
+```bash
+python -m engine ingest <path | file.zip | git-url>
+```
+
+```
+Project: FOUNDRY   (origin: folder)
+Solidity: 0.8.28  [foundry.toml]
+
+Solidity files: 8
+In scope:       4
+Tests:          3
+Mocks:          1
+Dependencies:   1
+Interfaces:     1
+
+RepoModel written to:
+  run/<run_id>/artifacts/repo.json
+```
+
+Useful flags: `--ref` (git branch/tag/commit), `--include GLOB` / `--exclude GLOB` (override the
+scope heuristics; exclude wins), `--run-root` (where run directories live).
+
+There is also a **Phase 1 harness** — upload a repo in the browser and inspect the
+`RepoModel` the reader produced. Two terminals, both from the repository root:
+
+```bash
+# 1. API (ingest endpoints only — the rest of the pipeline doesn't exist yet)
+engine/.venv/Scripts/python -m uvicorn engine.api.routes:app --reload --port 8000
+
+# 2. Frontend — http://localhost:5173, proxies /audits → :8000
 cd frontend && npm run dev
 ```
 
@@ -172,12 +199,17 @@ public API stability.
 
 ## Status
 
-🚧 **Early development — scaffolding stage.** The directory structure and specification are in
-place; module implementation is proceeding in artifact order:
+🚧 **Early development.** Modules land in artifact order — each one is finished and tested
+before the next begins:
 
-```
-core/models → ingest → parse → graphs → protocol → context → agents → orchestrator → validate → report
-```
+| Stage | Artifact | Status |
+|---|---|---|
+| `core/models`, `core/artifacts`, `core/errors` | — | ✅ |
+| `ingest` — Repository Reader | `RepoModel` | ✅ |
+| `ingest/build` — Foundry / Hardhat | solc AST, storage layout | ⏳ next |
+| `parse` | `CodeModel` | ⏳ |
+| `graphs` | `GraphModel` | ⏳ |
+| `protocol` → `context` → `agents` → `orchestrator` → `validate` → `report` | … → `report.md` | ⏳ |
 
 ## Disclaimer
 

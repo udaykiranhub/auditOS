@@ -7,6 +7,8 @@ requires-python = ">=3.11"
 
 [tool.pytest.ini_options]
 testpaths = ["../tests"]
+# The repo root, so tests import `engine.*` and `tests.*` the same way the CLI does.
+pythonpath = [".."]
 asyncio_mode = "auto"
 addopts = "-ra"
 
