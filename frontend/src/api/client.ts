@@ -6,7 +6,7 @@
  */
 
 import axios, { AxiosError } from 'axios'
-import type { ApiError, IngestResponse } from '../types/repo'
+import type { ApiError, BuildModel, IngestResponse } from '../types/repo'
 
 const http = axios.create({
   // Ingest is synchronous and a large repo takes a while; there is no job queue yet.
@@ -32,9 +32,19 @@ export function relativePathOf(file: File): string {
 }
 
 const DOC_EXTENSIONS = ['.md', '.markdown', '.rst', '.pdf']
-const CONFIG_NAMES = [
-  'foundry.toml',
-  'remappings.txt',
+
+/**
+ * Build config that must survive **at any depth**, including inside `lib/`.
+ *
+ * A Foundry dependency carries its own `remappings.txt` / `foundry.toml`, and the compiler
+ * needs them to resolve that dependency's imports — `lib/v4-periphery/remappings.txt` is
+ * what maps `@uniswap/v4-core/` to `lib/v4-periphery/lib/v4-core/`. Dropping these as
+ * "dependency files" strips a few kilobytes and breaks compilation of the whole project.
+ */
+const NESTED_CONFIG_NAMES = ['foundry.toml', 'remappings.txt', '.gitmodules']
+
+/** Config that is only meaningful at the project root — node_modules has thousands. */
+const ROOT_CONFIG_NAMES = [
   'package.json',
   'hardhat.config.js',
   'hardhat.config.ts',
@@ -43,13 +53,17 @@ const CONFIG_NAMES = [
 ]
 
 /**
- * Keep only what the Repository Reader actually opens.
+ * Keep only what the engine actually opens.
  *
- * It enumerates `*.sol` and reads config + docs; nothing else can change the `RepoModel`.
- * A real Hardhat project is mostly `node_modules` JavaScript, so sending everything means
- * tens of thousands of multipart parts and a minutes-long upload for no added signal.
- * `.sol` files under dependency roots are kept — they are what dependency classification
- * is about — but their READMEs and per-package `package.json` files are not.
+ * The Reader enumerates `*.sol` and reads config + docs; the Build stage additionally
+ * needs every `remappings.txt` / `foundry.toml` in the tree. Nothing else can change a
+ * `RepoModel` or a `BuildModel`. A real Hardhat project is mostly `node_modules`
+ * JavaScript, so sending everything means tens of thousands of multipart parts and a
+ * minutes-long upload for no added signal.
+ *
+ * Dependency `.sol` files are kept — they are what dependency classification is about, and
+ * the compiler needs them to resolve imports — but their READMEs and per-package
+ * `package.json` files are not.
  */
 export function isRelevantUpload(relativePath: string): boolean {
   const parts = relativePath.split('/').filter(Boolean)
@@ -60,11 +74,13 @@ export function isRelevantUpload(relativePath: string): boolean {
 
   if (lower.endsWith('.sol')) return true
 
+  const name = lower.split('/').pop() ?? ''
+  if (NESTED_CONFIG_NAMES.includes(name)) return true
+
   const underDependency = /(^|\/)(lib|node_modules|vendor|external)\//.test(lower)
   if (underDependency) return false
 
-  const name = lower.split('/').pop() ?? ''
-  if (CONFIG_NAMES.includes(name)) return true
+  if (ROOT_CONFIG_NAMES.includes(name)) return true
   return DOC_EXTENSIONS.some((extension) => lower.endsWith(extension))
 }
 
@@ -95,6 +111,42 @@ export async function ingestRemote(
   })
   return data
 }
+
+export interface BuildJobStatus {
+  run_id: string
+  state: 'running' | 'done' | 'error'
+  elapsed_seconds: number
+  model: BuildModel | null
+  error: string | null
+}
+
+/**
+ * Start a build and poll it to completion.
+ *
+ * Compiling a real protocol takes minutes — longer than any reasonable HTTP timeout, so
+ * holding a single request open turned a slow build into `timeout of 300000ms exceeded`,
+ * which reads as a failure when the compiler was still working. Each poll is a fast
+ * request instead, and `onProgress` lets the UI show that something is happening.
+ */
+export async function runBuild(
+  runId: string,
+  options: { allowHardhat?: boolean; onProgress?: (elapsedSeconds: number) => void } = {},
+): Promise<BuildModel> {
+  await http.post<BuildJobStatus>(`/audits/${runId}/build`, {
+    allow_hardhat: options.allowHardhat ?? false,
+  })
+
+  for (;;) {
+    await new Promise((resolve) => setTimeout(resolve, BUILD_POLL_INTERVAL_MS))
+    const { data } = await http.get<BuildJobStatus>(`/audits/${runId}/build/status`)
+
+    if (data.state === 'done' && data.model) return data.model
+    if (data.state === 'error') throw new Error(data.error ?? 'The build worker crashed.')
+    options.onProgress?.(data.elapsed_seconds)
+  }
+}
+
+const BUILD_POLL_INTERVAL_MS = 1500
 
 function splitGlobs(value: string): string[] {
   return value

@@ -68,14 +68,18 @@ npm run preview    # serve the production build
 
 ## Status
 
-🚧 **Phase 1 harness.** Not the four screens yet — one screen that exercises the only stage
-that exists:
+🚧 **Pipeline harness.** Not the four screens yet — one screen with a tab per implemented
+stage:
 
 ```
 Upload (zip · folder · git URL, + scope override)
    → POST /audits/upload | /audits/remote
-   → RepoPanel: counts, scope composition, file inventory with per-file reasons,
-     remappings, docs, detection notes, content hash
+   → RepoPanel:  counts, scope composition, file inventory with per-file reasons,
+                 remappings, docs, detection notes, content hash
+   → POST /audits/{run_id}/build
+   → BuildPanel: builder + status, solc requested vs resolved, compiler settings,
+                 per-contract storage layout with packing, selectors, bytecode sizes,
+                 diagnostics, AST paths
 ```
 
 The four-screen app arrives with the pipeline stages that need it — Progress and Logs need

@@ -13,11 +13,16 @@ judgment in the pipeline: **what code is in scope.**
 | `classify.py`   | scope heuristics + comment-stripping source signals (§9.3)   | — | ✅ |
 | `config.py`     | `foundry.toml` / `remappings.txt` / `hardhat.config` (as text) | — | ✅ |
 | `docs.py`       | README content + doc/whitepaper paths                        | — | ✅ |
-| `build/base.py` | `Builder` interface                                          | — | ⏳ |
-| `build/foundry.py` | `forge build --extra-output storageLayout ... --ast` (§10) | Degraded | ⏳ |
-| `build/hardhat.py` | `npx hardhat compile`, fall back to direct solc (§10)     | Degraded | ⏳ |
+| `build/base.py` | `Builder` interface + shared solc-output normalization         | — | ✅ |
+| `build/pipeline.py` | builder selection, degradation → `BuildModel` (§10)       | Degraded | ✅ |
+| `build/foundry.py` | `forge build --ast --extra-output storageLayout …` (§10)  | Degraded | ✅ |
+| `build/solc.py` | `solc --standard-json` — the RAW path and universal fallback  | Degraded | ✅ |
+| `build/hardhat.py` | `npx hardhat compile` — **opt-in only** (§10)              | Degraded | ✅ |
 
-Run it: `python -m engine ingest <path | zip | git-url>` → `run/<run_id>/artifacts/repo.json`.
+```bash
+python -m engine ingest <path | zip | git-url>   # → run/<run_id>/artifacts/repo.json
+python -m engine build  <path | zip | git-url>   # → …/repo.json + …/build.json
+```
 
 ## Pipeline order — one deliberate deviation from §9.1
 
@@ -69,4 +74,29 @@ code, tests contain attack code that pattern-matches as vulnerable).
 A protocol that does not compile must still be auditable (targets are often mid-refactor). On any
 build failure: log `BUILD_DEGRADED`, set `build_available = False`, continue. What is lost when the
 build fails: **storage slots/packing** and Slither (needs compilation). The report's "Coverage &
-Limitations" section must state exactly what degraded.
+Limitations" section must state exactly what degraded. Every exit from `pipeline.py` produces a
+`BuildModel` — including "no builder was available".
+
+Builder selection:
+
+| Project | First choice | Fallback |
+|---|---|---|
+| FOUNDRY | `forge build` | direct solc |
+| HARDHAT | **direct solc** | Hardhat, only with `--allow-hardhat` |
+| RAW | direct solc | — |
+
+**Hardhat is opt-in because `npx hardhat compile` executes `hardhat.config.js` and every plugin
+it requires — arbitrary code from the repository under audit.** The Reader deliberately refuses to
+execute that same file (§9.1); it would be incoherent for the next stage to run it unprompted. Pass
+`--allow-hardhat` or set `AUDITOS_ALLOW_HARDHAT=1` to permit it. Direct solc needs no JavaScript
+and no `node_modules`, so it is the default for Hardhat projects.
+
+## Two size decisions
+
+- **ASTs go to `run/<run_id>/build/ast/<path>.json`, not into the artifact.** One mid-size
+  contract's solc AST is megabytes; `BuildModel.sources` records the path and hash, exactly as
+  `RepoModel.docs` records paths rather than content.
+- **Bytecode is recorded as a size, not as bytes.** Deployed bytecode says nothing at source level
+  — except its length, which is a real finding (EIP-170's 24,576-byte limit).
+- ABI is inlined only for **in-scope** contracts; a repo's dependency ABIs add megabytes no agent
+  reads. `abi_omitted` records that the omission was a choice.

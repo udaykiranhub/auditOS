@@ -18,9 +18,11 @@ import argparse
 import sys
 from pathlib import Path
 
+from engine.core.artifacts import save_artifact
 from engine.core.errors import AuditOSError
 from engine.core.models.repo import ScopeOverride
-from engine.ingest.reader import ingest
+from engine.ingest.build.pipeline import build_and_save
+from engine.ingest.reader import ingest, read_repository
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -53,6 +55,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     ingest_cmd.add_argument("--run-root", type=Path, help="where run dirs live (default ./run)")
     ingest_cmd.add_argument("--run-id", help="use a fixed run id instead of a generated one")
+
+    build_cmd = sub.add_parser(
+        "build",
+        help="Read a repository, then compile it.",
+        description="ZIP | folder | git URL → repo.json + build.json",
+    )
+    build_cmd.add_argument("source", help="a folder, a .zip archive, or a git URL")
+    build_cmd.add_argument("--ref", help="git branch, tag or commit (git sources only)")
+    build_cmd.add_argument("--run-root", type=Path, help="where run dirs live (default ./run)")
+    build_cmd.add_argument("--run-id", help="use a fixed run id instead of a generated one")
+    build_cmd.add_argument(
+        "--allow-hardhat",
+        action="store_true",
+        help="permit `npx hardhat compile`, which EXECUTES the target's hardhat.config.js",
+    )
     return parser
 
 
@@ -91,11 +108,54 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_build(args: argparse.Namespace) -> int:
+    model, run_dir = read_repository(
+        args.source, ref=args.ref, run_root=args.run_root, run_id=args.run_id
+    )
+    save_artifact(model, run_dir, "repo")
+    build, artifact = build_and_save(model, run_dir, allow_hardhat=args.allow_hardhat)
+    counts = build.counts
+
+    print(f"Project:  {model.kind.value}   ({model.counts['in_scope']} files in scope)")
+    print(f"Builder:  {build.builder}")
+    print(f"Status:   {build.status}   (build_available={build.build_available})")
+    if build.solc_version_resolved:
+        print(f"Compiler: solc {build.solc_version_resolved}")
+    print()
+    print(f"Sources compiled: {counts['sources']}   (AST: {counts['with_ast']})")
+    print(f"Contracts:        {counts['contracts']}   (storage layout: {counts['with_storage']})")
+    print(f"Errors:           {counts['errors']}")
+    print(f"Warnings:         {counts['warnings']}")
+    if counts["oversize"]:
+        print(f"Over EIP-170:     {counts['oversize']}")
+
+    for diagnostic in build.errors[:5]:
+        location = f"{diagnostic.path}:{diagnostic.line}" if diagnostic.path else "—"
+        print(f"\n  error {location}\n    {diagnostic.message.splitlines()[0]}")
+
+    if build.notes:
+        print("\nNotes:")
+        for note in build.notes:
+            print(f"  - {note}")
+
+    print(f"\nBuildModel written to:\n  {artifact}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    # Windows consoles default to a legacy codepage, which mangles the en/em dashes and
+    # arrows in notes and diagnostics into "?". The artifacts are UTF-8 regardless; this
+    # just stops the terminal from lying about them.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+
     args = _build_parser().parse_args(argv)
     try:
         if args.command == "ingest":
             return _cmd_ingest(args)
+        if args.command == "build":
+            return _cmd_build(args)
     except AuditOSError as exc:
         # P6: fail loud, but as a clean message — never a traceback in the user's face.
         print(str(exc), file=sys.stderr)

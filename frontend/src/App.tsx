@@ -1,28 +1,37 @@
 /**
- * AuditOS — Phase 1 harness.
+ * AuditOS — pipeline harness.
  *
- * One screen: pick a target, run the Repository Reader, inspect the `RepoModel` it
- * produced. The four-screen app in SPEC §4 arrives with the stages that need it.
+ * One screen per implemented stage: pick a target, run the Repository Reader, then compile
+ * it, inspecting each artifact as it is produced. The four-screen app in SPEC §4 arrives
+ * with the stages that need it.
  */
 
 import { useMutation } from '@tanstack/react-query'
-import { ingestRemote, ingestUpload, toApiError } from './api/client'
+import { useEffect, useState } from 'react'
+import { ingestRemote, ingestUpload, runBuild, toApiError } from './api/client'
+import type { ScopeArgs } from './api/client'
+import BuildPanel from './components/BuildPanel'
 import RepoPanel from './components/RepoPanel'
 import UploadPanel, { type Source } from './components/UploadPanel'
-import type { ApiError, IngestResponse } from './types/repo'
-import type { ScopeArgs } from './api/client'
+import type { ApiError, BuildModel, IngestResponse } from './types/repo'
 
 const PIPELINE = [
   { label: 'Repository Reader', artifact: 'RepoModel', done: true },
-  { label: 'Build', artifact: 'solc AST', done: false },
+  // Optional by design: it enriches, it does not gate. The Parser is tree-sitter-primary
+  // and reads code that never compiles (SPEC §10, §12.1).
+  { label: 'Compiler enrichment', artifact: 'BuildModel (optional)', done: true },
   { label: 'Parser', artifact: 'CodeModel', done: false },
   { label: 'Graphs', artifact: 'GraphModel', done: false },
   { label: 'Protocol', artifact: 'ProtocolModel', done: false },
   { label: 'Agents → Report', artifact: 'report.md', done: false },
 ]
 
+type Tab = 'repo' | 'build'
+
 export default function App() {
-  const run = useMutation<IngestResponse, ApiError, { source: Source; scope: ScopeArgs }>({
+  const [tab, setTab] = useState<Tab>('repo')
+
+  const ingest = useMutation<IngestResponse, ApiError, { source: Source; scope: ScopeArgs }>({
     mutationFn: async ({ source, scope }) => {
       try {
         return source.mode === 'upload'
@@ -34,13 +43,39 @@ export default function App() {
     },
   })
 
+  const [elapsed, setElapsed] = useState(0)
+
+  const build = useMutation<BuildModel, ApiError, string>({
+    mutationFn: async (runId) => {
+      setElapsed(0)
+      try {
+        return await runBuild(runId, { onProgress: setElapsed })
+      } catch (error) {
+        throw toApiError(error)
+      }
+    },
+    onSuccess: () => setTab('build'),
+  })
+
+  // A new ingest invalidates any build: it describes a different repository.
+  useEffect(() => {
+    if (ingest.isPending) {
+      build.reset()
+      setTab('repo')
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ingest.isPending])
+
+  const error = ingest.error ?? build.error
+  const runId = ingest.data?.run_id
+
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-6 px-5 py-8">
       <header className="flex flex-wrap items-end justify-between gap-4">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">AuditOS</h1>
           <p className="mt-1 text-sm" style={{ color: 'var(--text-secondary)' }}>
-            AI smart-contract security engine · Phase 1 harness
+            AI smart-contract security engine · pipeline harness
           </p>
         </div>
 
@@ -66,11 +101,11 @@ export default function App() {
       </header>
 
       <UploadPanel
-        busy={run.isPending}
-        onRun={(source, scope) => run.mutate({ source, scope })}
+        busy={ingest.isPending}
+        onRun={(source, scope) => ingest.mutate({ source, scope })}
       />
 
-      {run.isError && (
+      {error && (
         <section
           className="rounded-xl border p-5"
           style={{
@@ -81,21 +116,72 @@ export default function App() {
           <div className="flex items-center gap-2">
             <span aria-hidden>⨯</span>
             <h2 className="text-sm font-semibold" style={{ color: 'var(--status-critical)' }}>
-              {run.error.code ?? 'Error'}
+              {error.code ?? 'Error'}
             </h2>
           </div>
-          <p className="mt-2 text-sm">{run.error.message}</p>
-          {run.error.hint && (
+          <p className="mt-2 text-sm">{error.message}</p>
+          {error.hint && (
             <p className="mono mt-2 text-xs" style={{ color: 'var(--text-secondary)' }}>
-              {run.error.hint}
+              {error.hint}
             </p>
           )}
         </section>
       )}
 
-      {run.isSuccess && <RepoPanel result={run.data} />}
+      {ingest.isSuccess && runId && (
+        <>
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="flex gap-1 rounded-lg p-1" style={{ background: 'var(--surface-1)' }}>
+              {(
+                [
+                  { key: 'repo', label: '1 · Repository Reader', enabled: true },
+                  { key: 'build', label: '2 · Compiler enrichment', enabled: build.isSuccess },
+                ] as const
+              ).map((option) => (
+                <button
+                  key={option.key}
+                  type="button"
+                  disabled={!option.enabled}
+                  onClick={() => setTab(option.key)}
+                  className="rounded-md px-3 py-1.5 text-xs font-medium transition-colors disabled:opacity-40"
+                  style={{
+                    background: tab === option.key ? 'var(--plane)' : 'transparent',
+                    color: tab === option.key ? 'var(--text-primary)' : 'var(--text-secondary)',
+                  }}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
 
-      {!run.isSuccess && !run.isError && !run.isPending && (
+            <button
+              type="button"
+              onClick={() => build.mutate(runId)}
+              disabled={build.isPending}
+              className="rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-40"
+              style={{ background: 'var(--series-1)', color: '#fff' }}
+            >
+              {build.isPending
+                ? `Compiling… ${elapsed.toFixed(0)}s`
+                : build.isSuccess
+                  ? 'Re-run enrichment'
+                  : 'Run compiler enrichment (optional)'}
+            </button>
+
+            {build.isPending && (
+              <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                Compiling a large protocol takes minutes. The run is not blocked — this
+                stage only adds storage layout, ABI and the compiler AST.
+              </span>
+            )}
+          </div>
+
+          {tab === 'repo' && <RepoPanel result={ingest.data} />}
+          {tab === 'build' && build.data && <BuildPanel build={build.data} />}
+        </>
+      )}
+
+      {!ingest.isSuccess && !ingest.isError && !ingest.isPending && (
         <p className="py-10 text-center text-sm" style={{ color: 'var(--text-muted)' }}>
           Pick a target above to produce a <span className="mono">RepoModel</span>.
         </p>

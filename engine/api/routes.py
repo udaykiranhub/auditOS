@@ -17,9 +17,13 @@ GET  /audits/{run_id}/repo   the persisted RepoModel
 
 from __future__ import annotations
 
+import json
 import shutil
 import tempfile
+import threading
+import time
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,7 +33,10 @@ from starlette.formparsers import MultiPartException
 
 from engine.core.artifacts import default_run_root, load_artifact
 from engine.core.errors import FatalError
+from engine.core.models.build import BuildModel
 from engine.core.models.repo import RepoModel, ScopeOverride
+from engine.ingest.build.pipeline import ARTIFACT_NAME as BUILD_ARTIFACT
+from engine.ingest.build.pipeline import build_and_save
 from engine.ingest.reader import ARTIFACT_NAME, ingest
 
 # Matches MAX_ARCHIVE_ENTRIES in ingest/materialize.py — an upload is a repo either way.
@@ -60,6 +67,71 @@ class RemoteRequest(BaseModel):
     exclude: list[str] = Field(default_factory=list)
 
 
+class BuildRequest(BaseModel):
+    """`allow_hardhat` permits `npx hardhat compile`, which EXECUTES the target's config."""
+
+    allow_hardhat: bool = False
+
+
+class BuildJobStatus(BaseModel):
+    """A build's progress. `model` is populated once `state` is `done`."""
+
+    run_id: str
+    state: Literal["running", "done", "error"]
+    elapsed_seconds: float
+    model: BuildModel | None = None
+    error: str | None = None
+
+
+class BuildJob:
+    """One background compilation.
+
+    In-process and deliberately not persisted: V1 has no job persistence across restarts
+    (SPEC §2.2 non-goals). The `BuildModel` on disk is the durable record; this is only
+    how a caller watches a build that is still running.
+    """
+
+    def __init__(self, run_id: str, allow_hardhat: bool | None = None):
+        self.run_id = run_id
+        self.allow_hardhat = allow_hardhat
+        self.state: Literal["running", "done", "error"] = "running"
+        self.model: BuildModel | None = None
+        self.error: str | None = None
+        self.started = time.monotonic()
+        self.finished: float | None = None
+        self._thread = threading.Thread(target=self._run, daemon=True, name=f"build-{run_id}")
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            repo = _load_repo(self.run_id)
+            model, _ = build_and_save(
+                repo, default_run_root() / self.run_id, allow_hardhat=self.allow_hardhat
+            )
+            self.model = model
+            self.state = "done"
+        except Exception as exc:  # a crashed builder must not take the server with it
+            self.error = f"{type(exc).__name__}: {exc}"
+            self.state = "error"
+        finally:
+            self.finished = time.monotonic()
+
+    def status(self) -> BuildJobStatus:
+        end = self.finished if self.finished is not None else time.monotonic()
+        return BuildJobStatus(
+            run_id=self.run_id,
+            state=self.state,
+            elapsed_seconds=round(end - self.started, 1),
+            model=self.model,
+            error=self.error,
+        )
+
+
+_BUILD_JOBS: dict[str, BuildJob] = {}
+
+
 class IngestResponse(BaseModel):
     run_id: str
     artifact_path: str
@@ -86,7 +158,7 @@ def _fatal(exc: FatalError) -> HTTPException:
 
 @app.get("/audits/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "phase": "1", "stage": "repository-reader"}
+    return {"status": "ok", "stages": "repository-reader,build"}
 
 
 @app.post("/audits/upload", response_model=IngestResponse)
@@ -175,6 +247,75 @@ def remote(request: RemoteRequest) -> IngestResponse:
 @app.get("/audits/{run_id}/repo", response_model=RepoModel)
 def get_repo(run_id: str) -> RepoModel:
     """Re-read a previous run's artifact from disk."""
+    return _load_repo(run_id)
+
+
+@app.post("/audits/{run_id}/build", status_code=202, response_model=BuildJobStatus)
+def start_build(run_id: str, request: BuildRequest | None = None) -> BuildJobStatus:
+    """Start compiling a run's repository (SPEC §10). Returns immediately.
+
+    Compilation of a real protocol takes minutes, which is longer than any sensible HTTP
+    timeout — holding the request open turned a slow build into a client-side error that
+    looked like a failure. The build runs on a worker thread and the caller polls
+    `GET /audits/{run_id}/build/status`.
+
+    A compilation failure is never an error here: a repository that does not compile still
+    produces a `BuildModel`, with `build_available=False` and the diagnostics explaining
+    why. Losing the storage layout must not cost the audit.
+    """
+    _load_repo(run_id)  # 404 now rather than inside the worker
+
+    existing = _BUILD_JOBS.get(run_id)
+    if existing and existing.state == "running":
+        return existing.status()
+
+    job = BuildJob(run_id, allow_hardhat=(request.allow_hardhat if request else None))
+    _BUILD_JOBS[run_id] = job
+    job.start()
+    return job.status()
+
+
+@app.get("/audits/{run_id}/build/status", response_model=BuildJobStatus)
+def build_status(run_id: str) -> BuildJobStatus:
+    """Poll a build. `state` is one of `running` | `done` | `error`."""
+    job = _BUILD_JOBS.get(run_id)
+    if job is None:
+        artifact = default_run_root() / run_id / "artifacts" / f"{BUILD_ARTIFACT}.json"
+        if artifact.is_file():
+            # A build from a previous server process: the artifact outlives the job table.
+            return BuildJobStatus(
+                run_id=run_id,
+                state="done",
+                elapsed_seconds=0.0,
+                model=load_artifact(BuildModel, artifact),
+            )
+        raise HTTPException(
+            status_code=404, detail={"message": f"No build has been started for run {run_id}."}
+        )
+    return job.status()
+
+
+@app.get("/audits/{run_id}/build", response_model=BuildModel)
+def get_build(run_id: str) -> BuildModel:
+    artifact = default_run_root() / run_id / "artifacts" / f"{BUILD_ARTIFACT}.json"
+    if not artifact.is_file():
+        raise HTTPException(
+            status_code=404, detail={"message": f"Run {run_id} has not been built."}
+        )
+    return load_artifact(BuildModel, artifact)
+
+
+@app.get("/audits/{run_id}/ast")
+def get_ast(run_id: str, path: str) -> dict:
+    """Serve one AST that the build wrote to disk (they are too large to inline)."""
+    run_dir = (default_run_root() / run_id).resolve()
+    target = (run_dir / path).resolve()
+    if not target.is_relative_to(run_dir / "build" / "ast") or not target.is_file():
+        raise HTTPException(status_code=404, detail={"message": f"No such AST: {path}"})
+    return json.loads(target.read_text(encoding="utf-8"))
+
+
+def _load_repo(run_id: str) -> RepoModel:
     artifact = default_run_root() / run_id / "artifacts" / f"{ARTIFACT_NAME}.json"
     if not artifact.is_file():
         raise HTTPException(status_code=404, detail={"message": f"No such run: {run_id}"})

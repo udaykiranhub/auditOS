@@ -22,7 +22,11 @@
   --series-3: #1baf7a; /* tests        */
   --series-4: #eda100; /* mocks        */
 
+  /* Status colours are reserved and never themed — they always ship with an icon and a
+     label, so state is never carried by hue alone. */
   --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-serious: #ec835a;
   --status-critical: #d03b3b;
 }
 

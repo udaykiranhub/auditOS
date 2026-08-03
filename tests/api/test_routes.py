@@ -9,6 +9,7 @@ extremely hard to read from the client side.
 from __future__ import annotations
 
 import io
+import time
 import zipfile
 from pathlib import Path
 
@@ -26,7 +27,7 @@ def client(tmp_path: Path, monkeypatch) -> TestClient:
 
 
 def test_health(client: TestClient):
-    assert client.get("/audits/health").json()["stage"] == "repository-reader"
+    assert "build" in client.get("/audits/health").json()["stages"]
 
 
 # ── Upload ────────────────────────────────────────────────────────────────────
@@ -146,3 +147,82 @@ def test_get_repo_by_run_id(client: TestClient, foundry_project: Path):
 
 def test_get_repo_unknown_run_id(client: TestClient):
     assert client.get("/audits/nope/repo").status_code == 404
+
+
+# ── Build (SPEC §10) ──────────────────────────────────────────────────────────
+
+def await_build(client: TestClient, run_id: str, timeout: float = 300.0) -> dict:
+    """Start a build and poll it, the way the frontend does.
+
+    The build runs on a worker thread and the request returns 202 immediately: compiling a
+    real protocol takes minutes, which is longer than any sensible HTTP timeout.
+    """
+    started = client.post(f"/audits/{run_id}/build")
+    assert started.status_code == 202
+    assert started.json()["state"] == "running"
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = client.get(f"/audits/{run_id}/build/status").json()
+        if status["state"] == "done":
+            return status["model"]
+        assert status["state"] != "error", status["error"]
+        time.sleep(0.2)
+    raise AssertionError(f"build did not finish within {timeout}s")
+
+
+def test_build_a_run(client: TestClient, foundry_project: Path):
+    run_id = client.post("/audits/remote", json={"source": str(foundry_project)}).json()["run_id"]
+
+    body = await_build(client, run_id)
+
+    assert body["repo_content_hash"]
+    assert body["status"] in {"success", "partial", "failed", "skipped"}
+    # Re-readable from disk afterwards.
+    assert client.get(f"/audits/{run_id}/build").json()["content_hash"] == body["content_hash"]
+
+
+def test_build_status_reports_elapsed_time(client: TestClient, foundry_project: Path):
+    run_id = client.post("/audits/remote", json={"source": str(foundry_project)}).json()["run_id"]
+    await_build(client, run_id)
+
+    status = client.get(f"/audits/{run_id}/build/status").json()
+    assert status["state"] == "done"
+    assert status["elapsed_seconds"] >= 0
+
+
+def test_polling_a_build_that_was_never_started_is_404(client: TestClient, foundry_project: Path):
+    run_id = client.post("/audits/remote", json={"source": str(foundry_project)}).json()["run_id"]
+    assert client.get(f"/audits/{run_id}/build/status").status_code == 404
+
+
+def test_a_failed_build_is_a_200_not_an_error(client: TestClient, tmp_path: Path):
+    """Losing the storage layout must not cost the audit — degraded, never fatal (§10.2)."""
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    (broken / "Broken.sol").write_text(
+        "pragma solidity ^0.8.20;\ncontract B {\n  function f() external {\n", encoding="utf-8"
+    )
+
+    run_id = client.post("/audits/remote", json={"source": str(broken)}).json()["run_id"]
+    body = await_build(client, run_id)
+
+    assert body["build_available"] is False
+    assert body["status"] in {"failed", "skipped"}
+
+
+def test_build_of_an_unknown_run_is_404(client: TestClient):
+    assert client.post("/audits/nope/build").status_code == 404
+
+
+def test_build_before_it_has_run_is_404(client: TestClient, foundry_project: Path):
+    run_id = client.post("/audits/remote", json={"source": str(foundry_project)}).json()["run_id"]
+    assert client.get(f"/audits/{run_id}/build").status_code == 404
+
+
+def test_ast_endpoint_refuses_traversal(client: TestClient, foundry_project: Path):
+    run_id = client.post("/audits/remote", json={"source": str(foundry_project)}).json()["run_id"]
+    client.post(f"/audits/{run_id}/build")
+
+    assert client.get(f"/audits/{run_id}/ast", params={"path": "../artifacts/repo.json"}).status_code == 404
+    assert client.get(f"/audits/{run_id}/ast", params={"path": "build/ast/nope.json"}).status_code == 404

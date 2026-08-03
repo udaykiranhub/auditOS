@@ -9,6 +9,9 @@ requires-python = ">=3.11"
 testpaths = ["../tests"]
 # The repo root, so tests import `engine.*` and `tests.*` the same way the CLI does.
 pythonpath = [".."]
+# pytest's DEFAULT norecursedirs contains "build" — which silently skips tests/build/
+# (the Build Pipeline's tests) with no warning at all. Restate the default without it.
+norecursedirs = ["*.egg", ".*", "_darcs", "CVS", "dist", "node_modules", "venv", "{arch}"]
 asyncio_mode = "auto"
 addopts = "-ra"
 

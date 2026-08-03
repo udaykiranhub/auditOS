@@ -60,3 +60,74 @@ export interface ApiError {
   message: string
   hint?: string | null
 }
+
+// ── BuildModel — mirrors engine/core/models/build.py ─────────────────────────
+
+export type Builder = 'foundry' | 'hardhat' | 'solc' | 'none'
+export type BuildStatus = 'success' | 'partial' | 'failed' | 'skipped'
+export type DiagnosticSeverity = 'error' | 'warning' | 'info'
+
+/** EIP-170: deployed bytecode above this cannot be deployed at all. */
+export const MAX_DEPLOYED_BYTECODE_BYTES = 24_576
+
+export interface Diagnostic {
+  severity: DiagnosticSeverity
+  message: string
+  error_code: string | null
+  path: string | null
+  line: number | null
+  column: number | null
+}
+
+export interface StorageSlot {
+  label: string
+  slot: number
+  offset: number
+  type_label: string
+  bytes_size: number | null
+  encoding: string | null
+}
+
+export interface ContractArtifact {
+  id: string
+  path: string
+  name: string
+  in_scope: boolean
+  storage: StorageSlot[]
+  method_identifiers: Record<string, string>
+  abi: Record<string, unknown>[]
+  abi_omitted: boolean
+  bytecode_size: number | null
+  deployed_bytecode_size: number | null
+}
+
+export interface SourceUnit {
+  path: string
+  ast_path: string | null
+  ast_sha256: string | null
+  ast_nodes: number | null
+}
+
+export interface CompilerSettings {
+  optimizer_enabled: boolean | null
+  optimizer_runs: number | null
+  evm_version: string | null
+  via_ir: boolean | null
+  remappings: string[]
+}
+
+export interface BuildModel {
+  schema_version: string
+  content_hash: string
+  repo_content_hash: string
+  builder: Builder
+  status: BuildStatus
+  build_available: boolean
+  solc_version_requested: string | null
+  solc_version_resolved: string | null
+  settings: CompilerSettings
+  sources: SourceUnit[]
+  contracts: ContractArtifact[]
+  diagnostics: Diagnostic[]
+  notes: string[]
+}

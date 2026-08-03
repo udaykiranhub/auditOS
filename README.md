@@ -127,10 +127,11 @@ run directory; see [.env.example](.env.example) for the full list. Keys are read
 
 ## Running
 
-The engine is a CLI first. Today one stage is implemented — the Repository Reader:
+The engine is a CLI first. Two stages are implemented:
 
 ```bash
-python -m engine ingest <path | file.zip | git-url>
+python -m engine ingest <path | file.zip | git-url>   # → repo.json
+python -m engine build  <path | file.zip | git-url>   # → repo.json + build.json
 ```
 
 ```
@@ -149,10 +150,12 @@ RepoModel written to:
 ```
 
 Useful flags: `--ref` (git branch/tag/commit), `--include GLOB` / `--exclude GLOB` (override the
-scope heuristics; exclude wins), `--run-root` (where run directories live).
+scope heuristics; exclude wins), `--run-root` (where run directories live), and on `build`,
+`--allow-hardhat` (permits `npx hardhat compile`, which **executes** the target's
+`hardhat.config.js` — off by default; Hardhat projects compile through direct solc instead).
 
-There is also a **Phase 1 harness** — upload a repo in the browser and inspect the
-`RepoModel` the reader produced. Two terminals, both from the repository root:
+There is also a **browser harness** — upload a repo and inspect each artifact as it is
+produced. Two terminals, both from the repository root:
 
 ```bash
 # 1. API (ingest endpoints only — the rest of the pipeline doesn't exist yet)
@@ -204,10 +207,10 @@ before the next begins:
 
 | Stage | Artifact | Status |
 |---|---|---|
-| `core/models`, `core/artifacts`, `core/errors` | — | ✅ |
+| `core/models`, `core/artifacts`, `core/errors`, `core/models/ids` | — | ✅ |
 | `ingest` — Repository Reader | `RepoModel` | ✅ |
-| `ingest/build` — Foundry / Hardhat | solc AST, storage layout | ⏳ next |
-| `parse` | `CodeModel` | ⏳ |
+| `ingest/build` — Foundry / solc / Hardhat | `BuildModel` (AST, storage layout) | ✅ |
+| `parse` — tree-sitter + solc AST enrichment | `CodeModel` | ⏳ next |
 | `graphs` | `GraphModel` | ⏳ |
 | `protocol` → `context` → `agents` → `orchestrator` → `validate` → `report` | … → `report.md` | ⏳ |
 
