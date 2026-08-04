@@ -8,25 +8,26 @@
 
 import { useMutation } from '@tanstack/react-query'
 import { useEffect, useState } from 'react'
-import { ingestRemote, ingestUpload, runBuild, toApiError } from './api/client'
+import { ingestRemote, ingestUpload, runBuild, runParse, toApiError } from './api/client'
 import type { ScopeArgs } from './api/client'
 import BuildPanel from './components/BuildPanel'
+import ParsePanel from './components/ParsePanel'
 import RepoPanel from './components/RepoPanel'
 import UploadPanel, { type Source } from './components/UploadPanel'
-import type { ApiError, BuildModel, IngestResponse } from './types/repo'
+import type { ApiError, BuildModel, CodeModel, IngestResponse } from './types/repo'
 
 const PIPELINE = [
   { label: 'Repository Reader', artifact: 'RepoModel', done: true },
   // Optional by design: it enriches, it does not gate. The Parser is tree-sitter-primary
   // and reads code that never compiles (SPEC §10, §12.1).
   { label: 'Compiler enrichment', artifact: 'BuildModel (optional)', done: true },
-  { label: 'Parser', artifact: 'CodeModel', done: false },
+  { label: 'Parser', artifact: 'CodeModel', done: true },
   { label: 'Graphs', artifact: 'GraphModel', done: false },
   { label: 'Protocol', artifact: 'ProtocolModel', done: false },
   { label: 'Agents → Report', artifact: 'report.md', done: false },
 ]
 
-type Tab = 'repo' | 'build'
+type Tab = 'repo' | 'build' | 'parse'
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('repo')
@@ -57,16 +58,28 @@ export default function App() {
     onSuccess: () => setTab('build'),
   })
 
-  // A new ingest invalidates any build: it describes a different repository.
+  const parse = useMutation<CodeModel, ApiError, string>({
+    mutationFn: async (runId) => {
+      try {
+        return await runParse(runId)
+      } catch (error) {
+        throw toApiError(error)
+      }
+    },
+    onSuccess: () => setTab('parse'),
+  })
+
+  // A new ingest invalidates the downstream artifacts: they describe another repository.
   useEffect(() => {
     if (ingest.isPending) {
       build.reset()
+      parse.reset()
       setTab('repo')
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ingest.isPending])
 
-  const error = ingest.error ?? build.error
+  const error = ingest.error ?? build.error ?? parse.error
   const runId = ingest.data?.run_id
 
   return (
@@ -136,6 +149,7 @@ export default function App() {
                 [
                   { key: 'repo', label: '1 · Repository Reader', enabled: true },
                   { key: 'build', label: '2 · Compiler enrichment', enabled: build.isSuccess },
+                  { key: 'parse', label: '3 · Parser', enabled: parse.isSuccess },
                 ] as const
               ).map((option) => (
                 <button
@@ -168,16 +182,33 @@ export default function App() {
                   : 'Run compiler enrichment (optional)'}
             </button>
 
+            <button
+              type="button"
+              onClick={() => parse.mutate(runId)}
+              disabled={parse.isPending}
+              className="rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-40"
+              style={{ background: 'var(--series-3)', color: '#fff' }}
+            >
+              {parse.isPending ? 'Parsing…' : parse.isSuccess ? 'Re-run parser' : 'Run parser'}
+            </button>
+
             {build.isPending && (
               <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
                 Compiling a large protocol takes minutes. The run is not blocked — this
                 stage only adds storage layout, ABI and the compiler AST.
               </span>
             )}
+            {parse.isPending && (
+              <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                Parsing every file, dependencies included — they are needed for inheritance
+                and call-graph completeness.
+              </span>
+            )}
           </div>
 
           {tab === 'repo' && <RepoPanel result={ingest.data} />}
           {tab === 'build' && build.data && <BuildPanel build={build.data} />}
+          {tab === 'parse' && parse.data && <ParsePanel code={parse.data} />}
         </>
       )}
 

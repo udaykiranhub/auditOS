@@ -220,3 +220,30 @@ def test_exclude_beats_include(tmp_path: Path, run_root: Path):
         scope_override=ScopeOverride(include=["src/*"], exclude=["src/Vault.sol"]),
     )
     assert not model.files[0].in_scope
+
+
+def test_a_repository_with_nothing_in_scope_says_so(tmp_path: Path, run_root: Path):
+    """A lone `Test.sol` is scored like a real protocol's test suite — correct, and
+    invisible unless the run states it, because every view filters to in-scope."""
+    root = tmp_path / "single-file"
+    write(root, "MyTest.sol", VAULT_SOL)
+
+    model, _ = read_repository(root, run_root=run_root)
+
+    assert model.counts["in_scope"] == 0
+    note = next(n for n in model.notes if n.startswith("SCOPE_EMPTY"))
+    assert "1 test/script" in note
+    assert "scope_override.include" in note
+
+
+def test_an_override_rescues_a_wrongly_excluded_file(tmp_path: Path, run_root: Path):
+    """The escape hatch SPEC §9.3 requires, exercised on the case that needs it most."""
+    root = tmp_path / "rescued"
+    write(root, "MyTest.sol", VAULT_SOL)
+
+    model, _ = read_repository(
+        root, run_root=run_root, scope_override=ScopeOverride(include=["*.sol"])
+    )
+
+    assert model.counts["in_scope"] == 1
+    assert not any(n.startswith("SCOPE_EMPTY") for n in model.notes)

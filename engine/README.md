@@ -75,3 +75,13 @@ wrapped in schema validation on the way out. That is the whole architecture.
 
 Auth · billing · multi-user · dashboards · databases · job persistence across restarts ·
 non-Solidity languages · exploit PoC generation · CI integration · public API stability.
+
+
+
+pedda@lenova MINGW64 /x/auditos (main)
+$ engine/.venv/Scripts/python -m uvicorn engine.api.routes:app --reload --port 8000
+
+
+pedda@lenova MINGW64 /x/auditos/frontend (main)
+$ npm run dev
+

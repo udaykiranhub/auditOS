@@ -6,7 +6,7 @@
  */
 
 import axios, { AxiosError } from 'axios'
-import type { ApiError, BuildModel, IngestResponse } from '../types/repo'
+import type { ApiError, BuildModel, CodeModel, IngestResponse } from '../types/repo'
 
 const http = axios.create({
   // Ingest is synchronous and a large repo takes a while; there is no job queue yet.
@@ -173,4 +173,16 @@ export function toApiError(error: unknown): ApiError {
     return { message: error.message }
   }
   return { message: String(error) }
+}
+
+/**
+ * Parse a run's repository into a `CodeModel` (SPEC §12).
+ *
+ * Synchronous, unlike the build: parsing cannot be skipped, so there is no partial result
+ * worth streaming. The engine uses the run's `BuildModel` when one exists — storage slots
+ * and canonical selectors are enrichment, never a precondition.
+ */
+export async function runParse(runId: string): Promise<CodeModel> {
+  const { data } = await http.post<CodeModel>(`/audits/${runId}/parse`)
+  return data
 }

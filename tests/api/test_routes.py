@@ -13,17 +13,9 @@ import time
 import zipfile
 from pathlib import Path
 
-import pytest
 from fastapi.testclient import TestClient
 
-from engine.api.routes import app
 from tests.conftest import FOUNDRY_TOML, VAULT_SOL
-
-
-@pytest.fixture
-def client(tmp_path: Path, monkeypatch) -> TestClient:
-    monkeypatch.setenv("AUDITOS_RUN_DIR", str(tmp_path / "run"))
-    return TestClient(app)
 
 
 def test_health(client: TestClient):

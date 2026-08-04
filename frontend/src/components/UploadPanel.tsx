@@ -26,6 +26,7 @@ export default function UploadPanel({ onRun, busy }: Props) {
   const [ref, setRef] = useState('')
   const [include, setInclude] = useState('')
   const [exclude, setExclude] = useState('')
+  const fileInput = useRef<HTMLInputElement>(null)
   const folderInput = useRef<HTMLInputElement>(null)
 
   const onDrop = useCallback((accepted: File[]) => {
@@ -89,9 +90,17 @@ export default function UploadPanel({ onRun, busy }: Props) {
       >
         <input {...getInputProps()} />
         <p className="text-sm font-medium">
-          {label || 'Drop a .zip or a project folder here'}
+          {label || 'Drop a .sol file, a .zip, or a project folder here'}
         </p>
-        <div className="mt-3 flex gap-2">
+        <div className="mt-3 flex flex-wrap justify-center gap-2">
+          <button
+            type="button"
+            onClick={() => fileInput.current?.click()}
+            className="rounded-lg border px-3 py-1.5 text-xs font-medium"
+            style={{ borderColor: 'var(--border)', color: 'var(--text-secondary)' }}
+          >
+            Choose files…
+          </button>
           <button
             type="button"
             onClick={() => folderInput.current?.click()}
@@ -114,6 +123,17 @@ export default function UploadPanel({ onRun, busy }: Props) {
             </button>
           )}
         </div>
+
+        {/* Two inputs, because a directory picker only lists *directories*: opening one to
+            look for a single .sol shows an empty window, which reads as a broken upload. */}
+        <input
+          ref={fileInput}
+          type="file"
+          hidden
+          multiple
+          accept=".sol,.zip,.toml,.txt,.json,.md"
+          onChange={(event) => onDrop(Array.from(event.target.files ?? []))}
+        />
 
         {/* webkitdirectory is not in React's HTML types; it is how a browser hands over
             a directory, and the relative paths ride along on each File. */}

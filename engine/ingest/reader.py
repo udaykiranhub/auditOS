@@ -90,6 +90,26 @@ def read_repository(
             hint="AuditOS audits Solidity. Check that the input is a contracts repository.",
         )
 
+    # Files but nothing to audit almost always means the heuristics over-matched — a lone
+    # `Test.sol` or `MockToken.sol` is scored exactly like the test suite of a real
+    # protocol. Correct by SPEC §9.3, and useless if the run never says so: every
+    # downstream view filters to in-scope by default and would simply look empty.
+    if not any(f.in_scope for f in files):
+        reasons = ", ".join(
+            f"{count} {label}"
+            for label, count in (
+                ("dependency", sum(f.is_dependency for f in files)),
+                ("test/script", sum(f.is_test for f in files)),
+                ("mock", sum(f.is_mock for f in files)),
+            )
+            if count
+        )
+        notes.append(
+            f"SCOPE_EMPTY: all {len(files)} Solidity files were excluded ({reasons}). "
+            "Nothing will be audited. If this is wrong, force files in with "
+            "scope_override.include (for example `*.sol`)."
+        )
+
     # 6. Documentation ────────────────────────────────────────────────────────
     readme, docs = discover_docs(repo_root, dependency_roots)
 

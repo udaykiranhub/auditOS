@@ -1,17 +1,19 @@
-"""FastAPI app (SPEC §6) — **Phase 1 slice only.**
+"""FastAPI app (SPEC §6) — the stages that exist so far.
 
-The full contract in `api/README.md` is four endpoints backed by a running pipeline. Only
-the Repository Reader exists, so only its slice is exposed: start a run, get a `RepoModel`
-back, synchronously. No job state, no SSE, no report — those arrive with the stages that
-produce them.
+The full contract in `api/README.md` assumes a complete pipeline. Only ingest, build and
+parse are implemented, so only their slice is exposed. No SSE, no report — those arrive
+with the stages that produce them.
 
-Every endpoint is something a human could `curl`; the frontend adds nothing the CLI can't
+Every endpoint is something a human could `curl`; the frontend adds nothing the CLI cannot
 already do (SPEC §4 hard rule).
 
 ```
-POST /audits/upload   multipart: a .zip, or a folder's files with relative paths
-POST /audits/remote   json: {"source": "<git url | local path>", "ref": "...", ...}
-GET  /audits/{run_id}/repo   the persisted RepoModel
+POST /audits/upload           multipart: a .zip, or a folder's files with relative paths
+POST /audits/remote           json: {"source": "<git url | local path>", "ref": …}
+GET  /audits/{run_id}/repo    the persisted RepoModel
+POST /audits/{run_id}/build   start compilation (202); poll /build/status
+POST /audits/{run_id}/parse   RepoModel (+ BuildModel) -> CodeModel
+GET  /audits/{run_id}/code    the persisted CodeModel
 ```
 """
 
@@ -34,10 +36,13 @@ from starlette.formparsers import MultiPartException
 from engine.core.artifacts import default_run_root, load_artifact
 from engine.core.errors import FatalError
 from engine.core.models.build import BuildModel
+from engine.core.models.code import CodeModel
 from engine.core.models.repo import RepoModel, ScopeOverride
 from engine.ingest.build.pipeline import ARTIFACT_NAME as BUILD_ARTIFACT
 from engine.ingest.build.pipeline import build_and_save
 from engine.ingest.reader import ARTIFACT_NAME, ingest
+from engine.parse.pipeline import ARTIFACT_NAME as CODE_ARTIFACT
+from engine.parse.pipeline import parse_and_save
 
 # Matches MAX_ARCHIVE_ENTRIES in ingest/materialize.py — an upload is a repo either way.
 MAX_UPLOAD_FILES = 20_000
@@ -45,7 +50,7 @@ MAX_UPLOAD_FILES = 20_000
 app = FastAPI(
     title="AuditOS",
     version="0.1.0",
-    description="AI smart-contract security engine — Phase 1: Repository Reader.",
+    description="AI smart-contract security engine.",
 )
 
 # The Vite dev server proxies /audits, so same-origin covers normal use. CORS is here for
@@ -158,7 +163,7 @@ def _fatal(exc: FatalError) -> HTTPException:
 
 @app.get("/audits/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "stages": "repository-reader,build"}
+    return {"status": "ok", "stages": "repository-reader,build,parse"}
 
 
 @app.post("/audits/upload", response_model=IngestResponse)
@@ -293,6 +298,42 @@ def build_status(run_id: str) -> BuildJobStatus:
             status_code=404, detail={"message": f"No build has been started for run {run_id}."}
         )
     return job.status()
+
+
+@app.post("/audits/{run_id}/parse", response_model=CodeModel)
+def parse(run_id: str) -> CodeModel:
+    """Parse a run's repository into a `CodeModel` (SPEC §12).
+
+    Synchronous: parsing a 3,700-file protocol takes a couple of minutes, but unlike a
+    build it cannot be skipped, so there is no partial result worth streaming. If this
+    grows past the request timeout it should adopt the same job/poll shape as the build.
+
+    Uses the run's `BuildModel` when one exists — storage slots and canonical selectors
+    are enrichment (§12.1), never a precondition.
+    """
+    repo = _load_repo(run_id)
+    run_dir = default_run_root() / run_id
+
+    build: BuildModel | None = None
+    build_artifact = run_dir / "artifacts" / f"{BUILD_ARTIFACT}.json"
+    if build_artifact.is_file():
+        build = load_artifact(BuildModel, build_artifact)
+
+    try:
+        code, _ = parse_and_save(repo, run_dir, build)
+    except FatalError as exc:
+        raise _fatal(exc) from exc
+    return code
+
+
+@app.get("/audits/{run_id}/code", response_model=CodeModel)
+def get_code(run_id: str) -> CodeModel:
+    artifact = default_run_root() / run_id / "artifacts" / f"{CODE_ARTIFACT}.json"
+    if not artifact.is_file():
+        raise HTTPException(
+            status_code=404, detail={"message": f"Run {run_id} has not been parsed."}
+        )
+    return load_artifact(CodeModel, artifact)
 
 
 @app.get("/audits/{run_id}/build", response_model=BuildModel)
