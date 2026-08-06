@@ -52,6 +52,10 @@ BUILTINS = {
     "days", "weeks", "unchecked", "emit", "delete", "return", "_",
 }
 
+#: Value types `new` can allocate in memory rather than deploy. `uintN`/`bytesN` are
+#: matched by prefix below, since spelling out all 32 widths of each buys nothing.
+ELEMENTARY_TYPES = {"address", "bool", "string", "bytes", "int", "uint", "fixed", "ufixed"}
+
 _ASSIGNMENTS = ("assignment_expression", "augmented_assignment_expression")
 _LOOPS = ("for_statement", "while_statement", "do_while_statement")
 _NESTED_DEFINITIONS = ("function_definition", "modifier_definition", "constructor_definition")
@@ -181,6 +185,38 @@ def _identifier_text(field: Node) -> str:
     return ""
 
 
+_OPERATOR_CHARS = "!~+-*/%<>=&|^?:,"
+
+
+def _is_elementary(name: str) -> bool:
+    """`bytes32`, `uint128`, `address` — anything `new` allocates instead of deploying."""
+    base = name.rstrip("0123456789")
+    return base in ELEMENTARY_TYPES and (base == name or name[len(base) :].isdigit())
+
+
+def _receiver_head(receiver: str) -> str:
+    """The operand a member call actually attaches to.
+
+    The grammar binds surrounding operators *inside* the member expression, so
+    `require(!factory.isPool(x))` gives an object node spanning `!factory`, and
+    `18 - ERC20(token).decimals()` gives one spanning `18 - ERC20(token)`. Neither operator
+    is part of the receiver, and leaving it there means the receiver never matches the
+    variable it names — so its declared type is never found, and an ordinary typed call is
+    recorded as a call to an unknown address. Scanning for the last top-level operator
+    recovers the operand; bracket depth keeps `IERC20(a - b)` intact.
+    """
+    depth = 0
+    cut = 0
+    for index, char in enumerate(receiver):
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif depth == 0 and char in _OPERATOR_CHARS:
+            cut = index + 1
+    return receiver[cut:].strip()
+
+
 def _classify_call(
     callee: Node,
     source: bytes,
@@ -200,14 +236,20 @@ def _classify_call(
 
     if node.type == "new_expression":
         target = node.child_by_field_name("name")
-        return CallKind.NEW, text_of(target, source) if target else "", None, sends_value
+        name = text_of(target, source) if target else ""
+        # `new bytes32[](n)` allocates memory; only `new C(...)` deploys a contract. Both
+        # are `new_expression`, and conflating them puts an array allocation on the call
+        # graph as a contract creation — which then reads as an external interaction.
+        if name.endswith("]") or _is_elementary(name):
+            return CallKind.BUILTIN, name, None, sends_value
+        return CallKind.NEW, name, None, sends_value
 
     if node.type == "member_expression":
         # The grammar names these, so read the fields rather than guessing by position:
         # `IERC20(t).transfer` has an `expression` object, not an identifier.
         object_node = node.child_by_field_name("object")
         property_node = node.child_by_field_name("property")
-        receiver = text_of(object_node, source) if object_node else ""
+        receiver = _receiver_head(text_of(object_node, source) if object_node else "")
         member = text_of(property_node, source) if property_node else ""
         head = receiver.split(".")[0].split("(")[0].strip()
 
@@ -285,9 +327,12 @@ def analyze_body(
                         kind=kind,
                         name=name,
                         receiver=receiver,
-                        text=text_of(callee, source)[:200],
+                        # Collapsed to one line: a callee expression can wrap across four
+                        # lines of source, and this text is quoted as evidence in findings.
+                        text=" ".join(text_of(callee, source).split())[:200],
                         line=line_of(current),
                         order=order,
+                        arg_count=arguments,
                         sends_value=sends_value,
                         is_delegate=name in DELEGATE_CALLS,
                         is_static=name == "staticcall",

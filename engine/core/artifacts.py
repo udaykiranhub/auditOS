@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import uuid
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypeVar
@@ -39,18 +40,34 @@ def canonical_json(payload: Any) -> str:
     Sorted keys and no incidental whitespace: two structurally equal payloads always
     produce the same string, so they always produce the same hash.
     """
-    return json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        default=str,
-    )
+    return "".join(_canonical_chunks(payload))
+
+
+def _canonical_chunks(payload: Any) -> Iterator[str]:
+    """The canonical form, one fragment at a time."""
+    return _CANONICAL_ENCODER.iterencode(payload)
+
+
+_CANONICAL_ENCODER = json.JSONEncoder(
+    sort_keys=True,
+    separators=(",", ":"),
+    ensure_ascii=False,
+    default=str,
+)
 
 
 def content_hash(payload: Any) -> str:
-    """SHA-256 of the canonical serialization of ``payload``."""
-    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+    """SHA-256 of the canonical serialization of ``payload``.
+
+    Fed to the digest in fragments rather than as one string. A real protocol's `CodeModel`
+    serializes to ~150 MB, and building that as a single `str` (then a second copy as UTF-8
+    bytes) raised `MemoryError` on a machine with memory to spare. The bytes hashed are
+    identical either way — this only stops them existing all at once.
+    """
+    digest = hashlib.sha256()
+    for chunk in _canonical_chunks(payload):
+        digest.update(chunk.encode("utf-8"))
+    return digest.hexdigest()
 
 
 def sha256_bytes(payload: bytes) -> str:
@@ -108,11 +125,23 @@ def save_artifact(model: BaseModel, run_dir: Path, name: str) -> Path:
     path = artifact_path(run_dir, name)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = model.model_dump(mode="json")
-    text = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
-    path.write_text(text, encoding="utf-8", newline="\n")
+    # Streamed for the same reason `content_hash` is: a large `CodeModel` is a 150 MB file,
+    # and `json.dumps` would build all of it as one string before a byte reaches disk.
+    encoder = json.JSONEncoder(indent=2, sort_keys=True, ensure_ascii=False, default=str)
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        for chunk in encoder.iterencode(payload):
+            handle.write(chunk)
+        handle.write("\n")
     return path
 
 
 def load_artifact(model_cls: type[M], path: Path) -> M:
-    """Read an artifact back into its Pydantic model."""
-    return model_cls.model_validate_json(path.read_text(encoding="utf-8"))
+    """Read an artifact back into its Pydantic model.
+
+    Bytes, not text. `read_text` decodes the whole file into a Python `str` first, and a
+    `str` containing any non-ASCII character costs two to four bytes per character — a
+    150 MB `code.json` from a real protocol becomes a 600 MB string, which is then handed
+    to a parser that re-encodes it to UTF-8 anyway. That raised `MemoryError` on a machine
+    with plenty of memory free. Pydantic parses UTF-8 bytes directly.
+    """
+    return model_cls.model_validate_json(path.read_bytes())

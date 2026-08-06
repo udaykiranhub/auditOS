@@ -30,3 +30,8 @@ strict = true
 [[tool.mypy.overrides]]
 module = ["engine.agents.*"]
 disallow_untyped_defs = false
+# NetworkX ships no type information. `types-networkx` is a third-party stub package whose
+# coverage lags the library; the one place we touch it is behind a typed wrapper.
+[[tool.mypy.overrides]]
+module = ["networkx.*"]
+ignore_missing_imports = true

@@ -27,7 +27,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "1.1.0"  # 1.1: CallSite.arg_count, for overload-correct call edges
 
 Visibility = Literal["public", "external", "internal", "private"]
 Mutability = Literal["pure", "view", "nonpayable", "payable"]
@@ -90,6 +90,9 @@ class CallSite(BaseModel):
     text: str  # the callee expression as written, for evidence
     line: int
     order: int  # position within the body — CEI analysis needs the sequence
+    # Overloads share a name and differ only in arity/types. Without this the graph engine
+    # picks an overload arbitrarily, which silently mis-resolves the call edge.
+    arg_count: int = -1  # -1 = unknown
     sends_value: bool = False  # `{value: …}`
     is_delegate: bool = False
     is_static: bool = False

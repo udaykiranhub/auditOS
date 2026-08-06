@@ -6,7 +6,7 @@
  */
 
 import axios, { AxiosError } from 'axios'
-import type { ApiError, BuildModel, CodeModel, IngestResponse } from '../types/repo'
+import type { ApiError, BuildModel, CodeModel, GraphModel, IngestResponse } from '../types/repo'
 
 const http = axios.create({
   // Ingest is synchronous and a large repo takes a while; there is no job queue yet.
@@ -155,6 +155,11 @@ function splitGlobs(value: string): string[] {
     .filter(Boolean)
 }
 
+const BACKEND_DOWN = 'Could not reach the engine on http://localhost:8000.'
+const START_COMMAND =
+  'Start it from the repository root:  ' +
+  'engine/.venv/Scripts/python -m uvicorn engine.api.routes:app --reload --port 8000'
+
 /** Turn any failure into the `{code, message, hint}` shape the UI renders. */
 export function toApiError(error: unknown): ApiError {
   if (error instanceof AxiosError) {
@@ -162,12 +167,18 @@ export function toApiError(error: unknown): ApiError {
     if (detail && typeof detail === 'object') return detail as ApiError
     if (typeof detail === 'string') return { message: detail }
     if (error.code === 'ERR_NETWORK') {
+      return { code: 'BACKEND_UNREACHABLE', message: BACKEND_DOWN, hint: START_COMMAND }
+    }
+    if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+      // A bare "timeout of 300000ms exceeded" says nothing about which of the two very
+      // different causes applied, and the five-minute wait makes a dead server look
+      // identical to a slow one.
       return {
-        code: 'BACKEND_UNREACHABLE',
-        message: 'Could not reach the engine on http://localhost:8000.',
-        hint:
-          'From the repository root:  ' +
-          'engine/.venv/Scripts/python -m uvicorn engine.api.routes:app --reload --port 8000',
+        code: 'REQUEST_TIMED_OUT',
+        message:
+          'The engine did not answer within 5 minutes. It is either still working on a ' +
+          'very large protocol, or it has stopped.',
+        hint: `Check it is alive:  curl http://localhost:8000/audits/health\n${START_COMMAND}`,
       }
     }
     return { message: error.message }
@@ -185,4 +196,24 @@ export function toApiError(error: unknown): ApiError {
 export async function runParse(runId: string): Promise<CodeModel> {
   const { data } = await http.post<CodeModel>(`/audits/${runId}/parse`)
   return data
+}
+
+/**
+ * Build the code property graph from a run's `CodeModel` (SPEC §13).
+ *
+ * Fast — pure computation over an artifact already on disk — so no polling. Requires a
+ * parse first; the engine answers 409 rather than silently re-parsing, because redoing an
+ * expensive stage implicitly hides which artifact you are looking at.
+ */
+export async function runGraph(runId: string): Promise<GraphModel> {
+  const { data } = await http.post<GraphModel>(`/audits/${runId}/graph`)
+  return data
+}
+
+/** One SPEC §13.5 query. `target` is a SolidityID for the queries that need one. */
+export async function graphQuery<T>(runId: string, q: string, target = ''): Promise<T> {
+  const { data } = await http.get<{ result: T }>(`/audits/${runId}/graph/query`, {
+    params: { q, target },
+  })
+  return data.result
 }

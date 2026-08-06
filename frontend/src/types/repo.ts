@@ -320,3 +320,77 @@ export interface CodeModel {
   notes: string[]
   enriched: boolean
 }
+
+// ── GraphModel (SPEC §7.5, §13) ──────────────────────────────────────────────
+// One code property graph; the "views" are edge-kind projections, not copies.
+
+export type Confidence = 'high' | 'medium' | 'low'
+
+export interface GraphNode {
+  id: string
+  kind: string
+  name: string
+  path: string
+  contract_id: string | null
+  line: number
+  visibility: string | null
+  mutability: string | null
+  type: string | null
+  slot: number | null
+  in_scope: boolean
+  is_dependency: boolean
+  is_entrypoint: boolean
+  is_implemented: boolean
+  has_assembly: boolean
+}
+
+export interface GraphEdge {
+  source: string
+  target: string
+  kind: string
+  confidence: Confidence
+  line: number
+  order: number
+  via: string | null
+  text: string
+}
+
+export interface ReentrancyCandidate {
+  entrypoint: string
+  function: string
+  path: string[]
+  external_target: string
+  external_call: string
+  external_line: number
+  writes_after: string[]
+  guard: string | null
+  confidence: Confidence
+}
+
+export interface Unresolved {
+  reason: string
+  function: string | null
+  detail: string
+  line: number
+}
+
+export interface ViewSummary {
+  kinds: string[]
+  nodes: number
+  edges: number
+}
+
+export interface GraphModel {
+  schema_version: string
+  content_hash: string
+  code_content_hash: string
+  nodes: GraphNode[]
+  edges: GraphEdge[]
+  linearization: Record<string, string[]>
+  override_chains: Record<string, string[]>
+  reentrancy_candidates: ReentrancyCandidate[]
+  unresolved: Unresolved[]
+  import_cycles: string[][]
+  views: Record<string, ViewSummary>
+  notes: string[]
+}

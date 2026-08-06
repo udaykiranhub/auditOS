@@ -41,6 +41,12 @@ def normalize_path(path: str) -> str:
 def canonical_type(type_name: str) -> str:
     """Canonicalize one solc type name: `uint` → `uint256`, `uint[]` → `uint256[]`."""
     text = type_name.strip()
+    # `address payable` and `address` share an ABI type, so solc computes the selector of
+    # `pay(address payable)` over `pay(address)`. Keeping the qualifier here would mean the
+    # tree-sitter ID and the compiler's `methodIdentifiers` key never join — silently, for
+    # exactly those functions that move ETH.
+    if text.startswith("address ") or text == "address payable":
+        text = "address"
     suffix = ""
     while text.endswith("]"):
         start = text.rfind("[")

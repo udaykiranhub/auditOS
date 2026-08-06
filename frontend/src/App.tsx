@@ -8,13 +8,14 @@
 
 import { useMutation } from '@tanstack/react-query'
 import { useEffect, useState } from 'react'
-import { ingestRemote, ingestUpload, runBuild, runParse, toApiError } from './api/client'
+import { ingestRemote, ingestUpload, runBuild, runGraph, runParse, toApiError } from './api/client'
 import type { ScopeArgs } from './api/client'
 import BuildPanel from './components/BuildPanel'
+import GraphPanel from './components/GraphPanel'
 import ParsePanel from './components/ParsePanel'
 import RepoPanel from './components/RepoPanel'
 import UploadPanel, { type Source } from './components/UploadPanel'
-import type { ApiError, BuildModel, CodeModel, IngestResponse } from './types/repo'
+import type { ApiError, BuildModel, CodeModel, GraphModel, IngestResponse } from './types/repo'
 
 const PIPELINE = [
   { label: 'Repository Reader', artifact: 'RepoModel', done: true },
@@ -22,12 +23,12 @@ const PIPELINE = [
   // and reads code that never compiles (SPEC §10, §12.1).
   { label: 'Compiler enrichment', artifact: 'BuildModel (optional)', done: true },
   { label: 'Parser', artifact: 'CodeModel', done: true },
-  { label: 'Graphs', artifact: 'GraphModel', done: false },
+  { label: 'Graphs', artifact: 'GraphModel', done: true },
   { label: 'Protocol', artifact: 'ProtocolModel', done: false },
   { label: 'Agents → Report', artifact: 'report.md', done: false },
 ]
 
-type Tab = 'repo' | 'build' | 'parse'
+type Tab = 'repo' | 'build' | 'parse' | 'graph'
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('repo')
@@ -69,17 +70,29 @@ export default function App() {
     onSuccess: () => setTab('parse'),
   })
 
+  const graph = useMutation<GraphModel, ApiError, string>({
+    mutationFn: async (runId) => {
+      try {
+        return await runGraph(runId)
+      } catch (error) {
+        throw toApiError(error)
+      }
+    },
+    onSuccess: () => setTab('graph'),
+  })
+
   // A new ingest invalidates the downstream artifacts: they describe another repository.
   useEffect(() => {
     if (ingest.isPending) {
       build.reset()
       parse.reset()
+      graph.reset()
       setTab('repo')
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ingest.isPending])
 
-  const error = ingest.error ?? build.error ?? parse.error
+  const error = ingest.error ?? build.error ?? parse.error ?? graph.error
   const runId = ingest.data?.run_id
 
   return (
@@ -150,6 +163,7 @@ export default function App() {
                   { key: 'repo', label: '1 · Repository Reader', enabled: true },
                   { key: 'build', label: '2 · Compiler enrichment', enabled: build.isSuccess },
                   { key: 'parse', label: '3 · Parser', enabled: parse.isSuccess },
+                  { key: 'graph', label: '4 · Graph', enabled: graph.isSuccess },
                 ] as const
               ).map((option) => (
                 <button
@@ -192,6 +206,17 @@ export default function App() {
               {parse.isPending ? 'Parsing…' : parse.isSuccess ? 'Re-run parser' : 'Run parser'}
             </button>
 
+            <button
+              type="button"
+              onClick={() => graph.mutate(runId)}
+              disabled={graph.isPending || !parse.isSuccess}
+              title={parse.isSuccess ? undefined : 'Run the parser first — the graph is built from its CodeModel.'}
+              className="rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-40"
+              style={{ background: 'var(--series-4)', color: '#fff' }}
+            >
+              {graph.isPending ? 'Graphing…' : graph.isSuccess ? 'Re-run graph' : 'Build graph'}
+            </button>
+
             {build.isPending && (
               <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
                 Compiling a large protocol takes minutes. The run is not blocked — this
@@ -209,6 +234,7 @@ export default function App() {
           {tab === 'repo' && <RepoPanel result={ingest.data} />}
           {tab === 'build' && build.data && <BuildPanel build={build.data} />}
           {tab === 'parse' && parse.data && <ParsePanel code={parse.data} />}
+          {tab === 'graph' && graph.data && <GraphPanel graph={graph.data} />}
         </>
       )}
 

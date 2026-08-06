@@ -21,6 +21,8 @@ from pathlib import Path
 from engine.core.artifacts import save_artifact
 from engine.core.errors import AuditOSError
 from engine.core.models.repo import ScopeOverride
+from engine.graphs.build import build_and_save as build_and_save_graph
+from engine.graphs.query import GraphQuery
 from engine.ingest.build.pipeline import build_and_save
 from engine.ingest.reader import ingest, read_repository
 from engine.parse.pipeline import parse_and_save
@@ -85,6 +87,21 @@ def _build_parser() -> argparse.ArgumentParser:
         "--build",
         action="store_true",
         help="compile first, so storage slots and selectors enrich the CodeModel",
+    )
+
+    graph_cmd = sub.add_parser(
+        "graph",
+        help="Read, parse, then build the code property graph.",
+        description="ZIP | folder | git URL → repo.json + code.json + graph.json",
+    )
+    graph_cmd.add_argument("source", help="a folder, a .zip archive, or a git URL")
+    graph_cmd.add_argument("--ref", help="git branch, tag or commit (git sources only)")
+    graph_cmd.add_argument("--run-root", type=Path, help="where run dirs live (default ./run)")
+    graph_cmd.add_argument("--run-id", help="use a fixed run id instead of a generated one")
+    graph_cmd.add_argument(
+        "--build",
+        action="store_true",
+        help="compile first, so storage slots and selectors enrich the graph",
     )
     return parser
 
@@ -204,6 +221,56 @@ def _cmd_parse(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_graph(args: argparse.Namespace) -> int:
+    repo, run_dir = read_repository(
+        args.source, ref=args.ref, run_root=args.run_root, run_id=args.run_id
+    )
+    save_artifact(repo, run_dir, "repo")
+
+    build = None
+    if args.build:
+        build, _ = build_and_save(repo, run_dir)
+
+    code, _ = parse_and_save(repo, run_dir, build)
+    graph, artifact = build_and_save_graph(code, run_dir)
+    counts = graph.counts
+    query = GraphQuery(graph)
+
+    print(f"Nodes: {counts['nodes']}   Edges: {counts['edges']}")
+    print(f"Entrypoints: {counts['entrypoints']}")
+    print()
+    print("Views:")
+    for name, summary in graph.views.items():
+        print(f"  {name:<12} {summary.edges:>6} edges over {summary.nodes:>5} nodes")
+
+    if graph.reentrancy_candidates:
+        print(f"\nReentrancy candidates: {len(graph.reentrancy_candidates)}")
+        for candidate in graph.reentrancy_candidates[:5]:
+            guard = f"  [guarded by {candidate.guard}]" if candidate.guard else ""
+            print(f"  - {candidate.function}{guard}")
+            print(f"      via {candidate.external_call} (line {candidate.external_line})")
+            print(f"      then writes {', '.join(candidate.writes_after)}")
+        if len(graph.reentrancy_candidates) > 5:
+            print(f"  … and {len(graph.reentrancy_candidates) - 5} more")
+
+    ranked = list(query.contract_centrality(5).items())
+    if ranked:
+        print("\nMost central contracts:")
+        for contract_id, rank in ranked:
+            print(f"  {rank:.4f}  {contract_id}")
+
+    if graph.import_cycles:
+        print(f"\nImport cycles: {len(graph.import_cycles)}")
+
+    if graph.notes:
+        print("\nNotes:")
+        for note in graph.notes:
+            print(f"  - {note}")
+
+    print(f"\nGraphModel written to:\n  {artifact}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     # Windows consoles default to a legacy codepage, which mangles the en/em dashes and
     # arrows in notes and diagnostics into "?". The artifacts are UTF-8 regardless; this
@@ -220,6 +287,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_build(args)
         if args.command == "parse":
             return _cmd_parse(args)
+        if args.command == "graph":
+            return _cmd_graph(args)
     except AuditOSError as exc:
         # P6: fail loud, but as a clean message — never a traceback in the user's face.
         print(str(exc), file=sys.stderr)

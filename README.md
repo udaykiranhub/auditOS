@@ -127,11 +127,13 @@ run directory; see [.env.example](.env.example) for the full list. Keys are read
 
 ## Running
 
-The engine is a CLI first. Two stages are implemented:
+The engine is a CLI first. Four stages are implemented, each a superset of the last:
 
 ```bash
 python -m engine ingest <path | file.zip | git-url>   # → repo.json
-python -m engine build  <path | file.zip | git-url>   # → repo.json + build.json
+python -m engine build  <path | file.zip | git-url>   # → + build.json
+python -m engine parse  <path | file.zip | git-url>   # → + code.json   (--build to enrich)
+python -m engine graph  <path | file.zip | git-url>   # → + graph.json
 ```
 
 ```
@@ -210,9 +212,10 @@ before the next begins:
 | `core/models`, `core/artifacts`, `core/errors`, `core/models/ids` | — | ✅ |
 | `ingest` — Repository Reader | `RepoModel` | ✅ |
 | `ingest/build` — Foundry / solc / Hardhat | `BuildModel` (AST, storage layout) | ✅ |
-| `parse` — tree-sitter + solc AST enrichment | `CodeModel` | ⏳ next |
-| `graphs` | `GraphModel` | ⏳ |
-| `protocol` → `context` → `agents` → `orchestrator` → `validate` → `report` | … → `report.md` | ⏳ |
+| `parse` — tree-sitter + solc AST enrichment | `CodeModel` | ✅ |
+| `graphs` — code property graph, C3, call/storage resolution | `GraphModel` | ✅ |
+| `protocol` — Protocol Understanding | `ProtocolModel` | ⏳ next |
+| `context` → `agents` → `orchestrator` → `validate` → `report` | … → `report.md` | ⏳ |
 
 ## Disclaimer
 

@@ -218,3 +218,42 @@ def test_ast_endpoint_refuses_traversal(client: TestClient, foundry_project: Pat
 
     assert client.get(f"/audits/{run_id}/ast", params={"path": "../artifacts/repo.json"}).status_code == 404
     assert client.get(f"/audits/{run_id}/ast", params={"path": "build/ast/nope.json"}).status_code == 404
+
+
+def test_upload_does_not_block_the_event_loop(client: TestClient):
+    """A slow upload must not freeze every other request.
+
+    The reassembly and ingest are seconds-to-minutes of blocking work. Run inline in the
+    `async def` handler they hold the event loop, so `/audits/health` — and every other
+    endpoint — hangs until the upload finishes. From the browser that is indistinguishable
+    from a dead server, and it surfaces as an unexplained five-minute timeout.
+    """
+    import threading
+
+    files = [("files", ("p/foundry.toml", FOUNDRY_TOML, "text/plain"))]
+    files += [
+        ("files", (f"p/src/C{index}.sol", f"contract C{index} {{}}", "text/plain"))
+        for index in range(400)
+    ]
+
+    latencies: list[float] = []
+    done = threading.Event()
+
+    def poll_health() -> None:
+        while not done.wait(0.02):
+            start = time.monotonic()
+            assert client.get("/audits/health").status_code == 200
+            latencies.append(time.monotonic() - start)
+
+    poller = threading.Thread(target=poll_health, daemon=True)
+    poller.start()
+    try:
+        response = client.post("/audits/upload", files=files, data={"include": "", "exclude": ""})
+    finally:
+        done.set()
+        poller.join(timeout=5)
+
+    assert response.status_code == 200
+    assert response.json()["counts"]["total"] == 400
+    assert latencies, "health was never polled during the upload"
+    assert max(latencies) < 2.0, f"health stalled for {max(latencies):.1f}s during the upload"

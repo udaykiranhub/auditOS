@@ -14,6 +14,9 @@ GET  /audits/{run_id}/repo    the persisted RepoModel
 POST /audits/{run_id}/build   start compilation (202); poll /build/status
 POST /audits/{run_id}/parse   RepoModel (+ BuildModel) -> CodeModel
 GET  /audits/{run_id}/code    the persisted CodeModel
+POST /audits/{run_id}/graph   CodeModel -> GraphModel (the code property graph)
+GET  /audits/{run_id}/graph   the persisted GraphModel
+GET  /audits/{run_id}/graph/query   the SPEC §13.5 queries, one call each
 ```
 """
 
@@ -25,11 +28,12 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Literal
+from typing import BinaryIO, Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartException
 
@@ -37,7 +41,11 @@ from engine.core.artifacts import default_run_root, load_artifact
 from engine.core.errors import FatalError
 from engine.core.models.build import BuildModel
 from engine.core.models.code import CodeModel
+from engine.core.models.graph import GraphModel
 from engine.core.models.repo import RepoModel, ScopeOverride
+from engine.graphs.build import ARTIFACT_NAME as GRAPH_ARTIFACT
+from engine.graphs.build import build_and_save as build_and_save_graph
+from engine.graphs.query import GraphQuery
 from engine.ingest.build.pipeline import ARTIFACT_NAME as BUILD_ARTIFACT
 from engine.ingest.build.pipeline import build_and_save
 from engine.ingest.reader import ARTIFACT_NAME, ingest
@@ -46,6 +54,10 @@ from engine.parse.pipeline import parse_and_save
 
 # Matches MAX_ARCHIVE_ENTRIES in ingest/materialize.py — an upload is a repo either way.
 MAX_UPLOAD_FILES = 20_000
+
+#: Contracts returned by the centrality query. Enough to rank "core contracts"; short
+#: enough that the answer stays readable.
+CENTRALITY_TOP = 25
 
 app = FastAPI(
     title="AuditOS",
@@ -163,7 +175,7 @@ def _fatal(exc: FatalError) -> HTTPException:
 
 @app.get("/audits/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "stages": "repository-reader,build,parse"}
+    return {"status": "ok", "stages": "repository-reader,build,parse,graph"}
 
 
 @app.post("/audits/upload", response_model=IngestResponse)
@@ -203,36 +215,53 @@ async def upload(request: Request) -> IngestResponse:
         )
 
     staging = Path(tempfile.mkdtemp(prefix="auditos-upload-"))
+    payload = [(item.filename or "", item.file) for item in files]
+
     try:
-        single_zip = len(files) == 1 and (files[0].filename or "").lower().endswith(".zip")
-
-        if single_zip:
-            target = staging / "upload.zip"
-            with target.open("wb") as handle:
-                shutil.copyfileobj(files[0].file, handle)
-            source: Path = target
-        else:
-            source = staging / "repo"
-            for item in files:
-                relative = _safe_relative(item.filename or "")
-                if relative is None:
-                    continue
-                destination = source / relative
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                with destination.open("wb") as handle:
-                    shutil.copyfileobj(item.file, handle)
-            if not source.exists():
-                raise HTTPException(
-                    status_code=400,
-                    detail={"message": "The upload contained no usable files."},
-                )
-
-        model, artifact = ingest(source, scope_override=_override(include, exclude))
+        # Off the event loop. Writing thousands of files and then reading the repository
+        # is seconds-to-minutes of blocking work; doing it inline froze the whole server —
+        # every other request, including `/audits/health`, simply hung until it finished,
+        # which reads from the browser as an unexplained timeout rather than a slow upload.
+        model, artifact = await run_in_threadpool(
+            _ingest_upload, payload, staging, _override(include, exclude)
+        )
         return _respond(model, artifact)
     except FatalError as exc:
         raise _fatal(exc) from exc
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
+        await run_in_threadpool(shutil.rmtree, staging, True)
+
+
+def _ingest_upload(
+    files: list[tuple[str, BinaryIO]],
+    staging: Path,
+    scope_override: ScopeOverride,
+) -> tuple[RepoModel, Path]:
+    """Write the uploaded parts to disk, then read them. Runs on a worker thread."""
+    single_zip = len(files) == 1 and files[0][0].lower().endswith(".zip")
+
+    if single_zip:
+        source = staging / "upload.zip"
+        with source.open("wb") as handle:
+            shutil.copyfileobj(files[0][1], handle)
+    else:
+        source = staging / "repo"
+        for filename, stream in files:
+            relative = _safe_relative(filename)
+            if relative is None:
+                continue
+            destination = source / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with destination.open("wb") as handle:
+                shutil.copyfileobj(stream, handle)
+        if not source.exists():
+            raise FatalError(
+                "The upload contained no usable files.",
+                code="UPLOAD_NO_USABLE_FILES",
+                hint="Every part was rejected as unsafe or empty.",
+            )
+
+    return ingest(source, scope_override=scope_override)
 
 
 @app.post("/audits/remote", response_model=IngestResponse)
@@ -334,6 +363,107 @@ def get_code(run_id: str) -> CodeModel:
             status_code=404, detail={"message": f"Run {run_id} has not been parsed."}
         )
     return load_artifact(CodeModel, artifact)
+
+
+@app.post("/audits/{run_id}/graph", response_model=GraphModel)
+def graph(run_id: str) -> GraphModel:
+    """Build the code property graph from a run's `CodeModel` (SPEC §13).
+
+    Fast — the graph is pure computation over an artifact already on disk, so unlike the
+    build there is nothing to poll. Parse first; there is no implicit re-parse here,
+    because silently redoing an expensive stage hides which artifact you are looking at.
+    """
+    run_dir = default_run_root() / run_id
+    code_artifact = run_dir / "artifacts" / f"{CODE_ARTIFACT}.json"
+    if not code_artifact.is_file():
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "GRAPH_NEEDS_PARSE",
+                "message": f"Run {run_id} has not been parsed.",
+                "hint": f"POST /audits/{run_id}/parse first.",
+            },
+        )
+
+    code = load_artifact(CodeModel, code_artifact)
+    try:
+        model, _ = build_and_save_graph(code, run_dir)
+    except FatalError as exc:
+        raise _fatal(exc) from exc
+    return model
+
+
+@app.get("/audits/{run_id}/graph", response_model=GraphModel)
+def get_graph(run_id: str) -> GraphModel:
+    return _load_graph(run_id)
+
+
+@app.get("/audits/{run_id}/graph/query")
+def graph_query(run_id: str, q: str, target: str = "") -> dict[str, object]:
+    """One SPEC §13.5 query per call — `?q=reaching_entrypoints&target=<SolidityID>`.
+
+    The graph itself is already served whole; this exists so the UI (and `curl`) can ask
+    the questions the Context Builder will ask, without reimplementing traversal in
+    TypeScript. Whatever answers here is exactly what an agent would receive.
+    """
+    query = GraphQuery(_load_graph(run_id))
+    handlers: dict[str, object] = {
+        "entrypoints": lambda: query.entrypoints(),
+        "reaching_entrypoints": lambda: query.reaching_entrypoints(target),
+        "entrypoint_paths": lambda: query.entrypoint_paths(target),
+        "neighborhood": lambda: sorted(query.neighborhood(target)),
+        "callers": lambda: query.callers(target),
+        "callees": lambda: query.callees(target),
+        "writers_of": lambda: query.writers_of(target),
+        "readers_of": lambda: query.readers_of(target),
+        "state_reads": lambda: query.state_reads(target),
+        "state_writes": lambda: query.state_writes(target),
+        "privileged_writes": lambda: query.privileged_writes(),
+        "privileged_variables": lambda: query.privileged_variables(),
+        "permissions": lambda: query.permissions(target),
+        "external_call_paths": lambda: query.external_call_paths(target),
+        "external_calls": lambda: query.external_calls(),
+        "delegatecall_targets": lambda: query.delegatecall_targets(),
+        "reentrancy_candidates": lambda: query.reentrancy_candidates(),
+        "token_flows": lambda: query.token_flows(target or None),
+        "inheritance": lambda: query.inheritance(target),
+        "override_chain": lambda: query.override_chain(target),
+        "program_slice": lambda: query.program_slice(target),
+        "function_dependencies": lambda: query.function_dependencies(target),
+        "variable_dependencies": lambda: query.variable_dependencies(target),
+        "centrality": lambda: query.contract_centrality(CENTRALITY_TOP),
+        "view": lambda: query.view(target),
+    }
+
+    handler = handlers.get(q)
+    if handler is None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "GRAPH_UNKNOWN_QUERY",
+                "message": f"No such query: {q}",
+                "hint": f"Known queries: {', '.join(sorted(handlers))}",
+            },
+        )
+    try:
+        return {"query": q, "target": target, "result": handler()}  # type: ignore[operator]
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=400, detail={"code": "GRAPH_BAD_TARGET", "message": str(exc)}
+        ) from exc
+
+
+def _load_graph(run_id: str) -> GraphModel:
+    artifact = default_run_root() / run_id / "artifacts" / f"{GRAPH_ARTIFACT}.json"
+    if not artifact.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": f"Run {run_id} has no graph.",
+                "hint": f"POST /audits/{run_id}/graph first.",
+            },
+        )
+    return load_artifact(GraphModel, artifact)
 
 
 @app.get("/audits/{run_id}/build", response_model=BuildModel)
