@@ -394,3 +394,104 @@ export interface GraphModel {
   views: Record<string, ViewSummary>
   notes: string[]
 }
+
+// ── ProtocolModel (SPEC §7.6) ────────────────────────────────────────────────
+// The summary view, not the whole artifact. A ProtocolModel for a real repository is
+// megabytes and this screen wants a couple of dozen numbers, so the engine serves
+// `/protocol/summary` — every field of which is read off the stored artifact rather than
+// recomputed, so the two can never disagree.
+
+/** How a claim was arrived at. Ordered weakest-first; `derived` and above are grounded. */
+export type ClaimConfidence =
+  | 'refuted'
+  | 'proposed'
+  | 'inferred'
+  | 'derived'
+  | 'stated'
+  | 'verified'
+
+export interface ProtocolIdentity {
+  id: string
+  name: string
+  origin: string
+  commit: string | null
+  solidity_version: string | null
+  description: string
+}
+
+export interface ProtocolCoverage {
+  contracts_total: number
+  contracts_classified: number
+  entrypoints_total: number
+  operations_modelled: number
+  state_vars_total: number
+  state_vars_explained: number
+  grounded_claims: number
+  ungrounded_claims: number
+  /** Named blind spots. Silence here would read as completeness. */
+  unmodelled: string[]
+}
+
+export interface ContractRoleRow {
+  contract_id: string
+  name: string
+  role: string
+}
+
+export interface RiskSurfaceRow {
+  id: string
+  kind: string
+  title: string
+  priority: number
+  targets: string[]
+  agents: string[]
+}
+
+export interface DocConflictRow {
+  statement: string
+  finding: string
+  subjects: string[]
+}
+
+export interface InvariantRow {
+  label: string
+  statement: string
+  kind: string
+  /** Starts at `candidate`; only an executed Forge run can reach `verified`. */
+  status: 'candidate' | 'supported' | 'verified' | 'refuted' | 'unverifiable'
+  targets: string[]
+}
+
+export interface OpenQuestionRow {
+  id: string
+  question: string
+  blocking: boolean
+}
+
+export interface EnrichmentRow {
+  applied: boolean
+  provider: string
+  model: string
+  prompt_hash: string
+  gaps_answered: number
+  gaps_rejected: number
+  notes: string[]
+}
+
+export interface ProtocolSummary {
+  identity: ProtocolIdentity
+  summary: string
+  archetype: string[]
+  counts: Record<string, number>
+  coverage: ProtocolCoverage
+  confidence: Record<ClaimConfidence, number>
+  evidence: Record<string, number>
+  core_contracts: string[]
+  roles: ContractRoleRow[]
+  top_risk_surfaces: RiskSurfaceRow[]
+  documentation_conflicts: DocConflictRow[]
+  invariants: InvariantRow[]
+  open_questions: OpenQuestionRow[]
+  enrichment: EnrichmentRow
+  notes: string[]
+}

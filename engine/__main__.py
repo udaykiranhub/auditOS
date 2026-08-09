@@ -26,6 +26,9 @@ from engine.graphs.query import GraphQuery
 from engine.ingest.build.pipeline import build_and_save
 from engine.ingest.reader import ingest, read_repository
 from engine.parse.pipeline import parse_and_save
+from engine.protocol.assemble import finalize
+from engine.protocol.assemble import save as save_protocol
+from engine.protocol.understand import understand
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -102,6 +105,33 @@ def _build_parser() -> argparse.ArgumentParser:
         "--build",
         action="store_true",
         help="compile first, so storage slots and selectors enrich the graph",
+    )
+
+    protocol_cmd = sub.add_parser(
+        "protocol",
+        help="Read, parse, graph, then interpret into a ProtocolModel.",
+        description="ZIP | folder | git URL → repo.json + code.json + graph.json + "
+        "protocol.json (no API key required)",
+    )
+    protocol_cmd.add_argument("source", help="a folder, a .zip archive, or a git URL")
+    protocol_cmd.add_argument("--ref", help="git branch, tag or commit (git sources only)")
+    protocol_cmd.add_argument("--run-root", type=Path, help="where run dirs live (default ./run)")
+    protocol_cmd.add_argument("--run-id", help="use a fixed run id instead of a generated one")
+    protocol_cmd.add_argument(
+        "--build",
+        action="store_true",
+        help="compile first, so storage slots and selectors enrich the model",
+    )
+    protocol_cmd.add_argument(
+        "--enrich",
+        action="store_true",
+        help="answer semantic gaps with an LLM (requires ANTHROPIC_API_KEY or OPENAI_API_KEY); "
+        "the model is complete without this",
+    )
+    protocol_cmd.add_argument(
+        "--verify",
+        action="store_true",
+        help="generate and run Forge invariant tests (requires forge on PATH)",
     )
     return parser
 
@@ -271,6 +301,100 @@ def _cmd_graph(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_protocol(args: argparse.Namespace) -> int:
+    repo, run_dir = read_repository(
+        args.source, ref=args.ref, run_root=args.run_root, run_id=args.run_id
+    )
+    save_artifact(repo, run_dir, "repo")
+
+    build = None
+    if args.build:
+        build, _ = build_and_save(repo, run_dir)
+
+    code, _ = parse_and_save(repo, run_dir, build)
+    graph, _ = build_and_save_graph(code, run_dir)
+    model = understand(code, graph, repo)
+
+    if args.enrich:
+        from engine.protocol.enrich import default_provider, enrich
+
+        provider = default_provider()
+        if not provider.available:
+            print("No LLM provider configured — skipping enrichment.", file=sys.stderr)
+        model = finalize(enrich(model, code, provider), code)
+
+    verification = None
+    if args.verify:
+        from engine.protocol.verify import verify as run_forge
+
+        model, verification = run_forge(model, Path(repo.root), run_dir)
+        model = finalize(model, code)
+
+    _, artifact = save_protocol(model, run_dir)
+    counts = model.counts
+
+    print(f"Protocol: {model.identity.name}")
+    print(f"Archetype: {', '.join(model.archetype) or 'unknown'}")
+    print()
+    print(f"Contracts classified: {model.coverage.contracts_classified}"
+          f"/{model.coverage.contracts_total}")
+    print(f"Operations modelled:  {counts['operations']}"
+          f"/{model.coverage.entrypoints_total} entrypoints"
+          f"   ({len(model.privileged)} privileged)")
+    print(f"Actors:               {counts['actors']}")
+    print(f"Assets / flows:       {counts['assets']} / {counts['asset_flows']}")
+    print(f"State explained:      {model.coverage.state_vars_explained}"
+          f"/{model.coverage.state_vars_total}")
+    print(f"Dependencies:         {counts['dependencies']}")
+    print(f"Candidate invariants: {counts['invariants']}")
+    print(f"Risk surfaces:        {counts['risk_surfaces']}")
+    print(f"Open questions:       {counts['gaps']}")
+
+    if model.contracts:
+        print("\nContract roles:")
+        for classification in sorted(model.contracts, key=lambda c: -c.centrality)[:8]:
+            print(f"  {classification.role.value:<18} {classification.name}")
+
+    if model.conflicts:
+        print(f"\nDocumentation conflicts: {len(model.conflicts)}")
+        for rule in model.conflicts[:3]:
+            print(f"  - {rule.statement[:90]}")
+            print(f"    → {rule.finding[:90]}")
+
+    top = sorted(model.risk_surfaces, key=lambda s: -s.priority)[:5]
+    if top:
+        print("\nHighest-priority risk surfaces:")
+        for surface in top:
+            print(f"  {surface.priority:.2f}  {surface.kind.value:<22} {surface.title[:60]}")
+
+    if verification is not None:
+        print(
+            f"\nForge verification: {verification.passed} passed, "
+            f"{verification.failed} REFUTED, {verification.errored} errored, "
+            f"{verification.skipped} not mechanically checkable"
+        )
+
+    if model.enrichment.applied or model.enrichment.provider not in ("", "none"):
+        print(
+            f"\nEnrichment ({model.enrichment.provider}): "
+            f"{model.enrichment.gaps_answered} answered, "
+            f"{model.enrichment.gaps_rejected} rejected"
+        )
+
+    histogram = model.confidence_histogram()
+    print("\nClaim confidence: " + "  ".join(
+        f"{level}={count}" for level, count in histogram.items() if count
+    ))
+
+    if model.notes:
+        print("\nNotes:")
+        for note in model.notes:
+            print(f"  - {note}")
+
+    print(f"\nProtocolModel written to:\n  {artifact}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     # Windows consoles default to a legacy codepage, which mangles the en/em dashes and
     # arrows in notes and diagnostics into "?". The artifacts are UTF-8 regardless; this
@@ -289,6 +413,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_parse(args)
         if args.command == "graph":
             return _cmd_graph(args)
+        if args.command == "protocol":
+            return _cmd_protocol(args)
     except AuditOSError as exc:
         # P6: fail loud, but as a clean message — never a traceback in the user's face.
         print(str(exc), file=sys.stderr)

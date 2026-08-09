@@ -8,14 +8,30 @@
 
 import { useMutation } from '@tanstack/react-query'
 import { useEffect, useState } from 'react'
-import { ingestRemote, ingestUpload, runBuild, runGraph, runParse, toApiError } from './api/client'
+import {
+  ingestRemote,
+  ingestUpload,
+  runBuild,
+  runGraph,
+  runParse,
+  runProtocol,
+  toApiError,
+} from './api/client'
 import type { ScopeArgs } from './api/client'
 import BuildPanel from './components/BuildPanel'
 import GraphPanel from './components/GraphPanel'
 import ParsePanel from './components/ParsePanel'
+import ProtocolPanel from './components/ProtocolPanel'
 import RepoPanel from './components/RepoPanel'
 import UploadPanel, { type Source } from './components/UploadPanel'
-import type { ApiError, BuildModel, CodeModel, GraphModel, IngestResponse } from './types/repo'
+import type {
+  ApiError,
+  BuildModel,
+  CodeModel,
+  GraphModel,
+  IngestResponse,
+  ProtocolSummary,
+} from './types/repo'
 
 const PIPELINE = [
   { label: 'Repository Reader', artifact: 'RepoModel', done: true },
@@ -24,11 +40,11 @@ const PIPELINE = [
   { label: 'Compiler enrichment', artifact: 'BuildModel (optional)', done: true },
   { label: 'Parser', artifact: 'CodeModel', done: true },
   { label: 'Graphs', artifact: 'GraphModel', done: true },
-  { label: 'Protocol', artifact: 'ProtocolModel', done: false },
+  { label: 'Protocol', artifact: 'ProtocolModel', done: true },
   { label: 'Agents → Report', artifact: 'report.md', done: false },
 ]
 
-type Tab = 'repo' | 'build' | 'parse' | 'graph'
+type Tab = 'repo' | 'build' | 'parse' | 'graph' | 'protocol'
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('repo')
@@ -81,18 +97,32 @@ export default function App() {
     onSuccess: () => setTab('graph'),
   })
 
+  const protocol = useMutation<ProtocolSummary, ApiError, string>({
+    mutationFn: async (runId) => {
+      try {
+        // Deterministic by default: no enrichment, no verification, no API key. Those are
+        // opt-in layers over a model that is already complete.
+        return await runProtocol(runId)
+      } catch (error) {
+        throw toApiError(error)
+      }
+    },
+    onSuccess: () => setTab('protocol'),
+  })
+
   // A new ingest invalidates the downstream artifacts: they describe another repository.
   useEffect(() => {
     if (ingest.isPending) {
       build.reset()
       parse.reset()
       graph.reset()
+      protocol.reset()
       setTab('repo')
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ingest.isPending])
 
-  const error = ingest.error ?? build.error ?? parse.error ?? graph.error
+  const error = ingest.error ?? build.error ?? parse.error ?? graph.error ?? protocol.error
   const runId = ingest.data?.run_id
 
   return (
@@ -164,6 +194,7 @@ export default function App() {
                   { key: 'build', label: '2 · Compiler enrichment', enabled: build.isSuccess },
                   { key: 'parse', label: '3 · Parser', enabled: parse.isSuccess },
                   { key: 'graph', label: '4 · Graph', enabled: graph.isSuccess },
+                  { key: 'protocol', label: '5 · Protocol', enabled: protocol.isSuccess },
                 ] as const
               ).map((option) => (
                 <button
@@ -217,6 +248,25 @@ export default function App() {
               {graph.isPending ? 'Graphing…' : graph.isSuccess ? 'Re-run graph' : 'Build graph'}
             </button>
 
+            <button
+              type="button"
+              onClick={() => protocol.mutate(runId)}
+              disabled={protocol.isPending || !graph.isSuccess}
+              title={
+                graph.isSuccess
+                  ? undefined
+                  : 'Build the graph first — the protocol model is interpreted from it.'
+              }
+              className="rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-40"
+              style={{ background: 'var(--series-2)', color: '#fff' }}
+            >
+              {protocol.isPending
+                ? 'Interpreting…'
+                : protocol.isSuccess
+                  ? 'Re-run protocol'
+                  : 'Understand protocol'}
+            </button>
+
             {build.isPending && (
               <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
                 Compiling a large protocol takes minutes. The run is not blocked — this
@@ -235,6 +285,7 @@ export default function App() {
           {tab === 'build' && build.data && <BuildPanel build={build.data} />}
           {tab === 'parse' && parse.data && <ParsePanel code={parse.data} />}
           {tab === 'graph' && graph.data && <GraphPanel graph={graph.data} />}
+          {tab === 'protocol' && protocol.data && <ProtocolPanel protocol={protocol.data} />}
         </>
       )}
 

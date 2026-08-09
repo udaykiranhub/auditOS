@@ -6,7 +6,14 @@
  */
 
 import axios, { AxiosError } from 'axios'
-import type { ApiError, BuildModel, CodeModel, GraphModel, IngestResponse } from '../types/repo'
+import type {
+  ApiError,
+  BuildModel,
+  CodeModel,
+  GraphModel,
+  IngestResponse,
+  ProtocolSummary,
+} from '../types/repo'
 
 const http = axios.create({
   // Ingest is synchronous and a large repo takes a while; there is no job queue yet.
@@ -216,4 +223,30 @@ export async function graphQuery<T>(runId: string, q: string, target = ''): Prom
     params: { q, target },
   })
   return data.result
+}
+
+/**
+ * Interpret a run's `CodeModel` + `GraphModel` into a `ProtocolModel` (SPEC §7.6, §8).
+ *
+ * Synchronous like the graph: the deterministic pass is pure computation over artifacts
+ * already on disk. Requires a graph first; the engine answers 409 rather than silently
+ * re-running an upstream stage.
+ *
+ * `enrich` is off by default and stays that way unless a caller asks. Turning it on makes
+ * the call network-bound and spends an API budget — and, more importantly, makes the
+ * artifact non-comparable to the deterministic run before it, which is the comparison the
+ * whole architecture exists to enable.
+ */
+export async function runProtocol(
+  runId: string,
+  options: { enrich?: boolean; verify?: boolean } = {},
+): Promise<ProtocolSummary> {
+  await http.post(`/audits/${runId}/protocol`, {
+    enrich: options.enrich ?? false,
+    verify: options.verify ?? false,
+  })
+  // The model itself is megabytes; this screen wants the summary the engine derives from
+  // the artifact it just wrote.
+  const { data } = await http.get<ProtocolSummary>(`/audits/${runId}/protocol/summary`)
+  return data
 }

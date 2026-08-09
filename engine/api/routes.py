@@ -17,6 +17,9 @@ GET  /audits/{run_id}/code    the persisted CodeModel
 POST /audits/{run_id}/graph   CodeModel -> GraphModel (the code property graph)
 GET  /audits/{run_id}/graph   the persisted GraphModel
 GET  /audits/{run_id}/graph/query   the SPEC §13.5 queries, one call each
+POST /audits/{run_id}/protocol      CodeModel + GraphModel -> ProtocolModel
+GET  /audits/{run_id}/protocol      the persisted ProtocolModel
+GET  /audits/{run_id}/protocol/summary   the overview, without the megabytes
 ```
 """
 
@@ -28,11 +31,11 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import BinaryIO, Literal
+from typing import Any, BinaryIO, Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartException
@@ -42,6 +45,8 @@ from engine.core.errors import FatalError
 from engine.core.models.build import BuildModel
 from engine.core.models.code import CodeModel
 from engine.core.models.graph import GraphModel
+from engine.core.models.protocol import ARTIFACT_NAME as PROTOCOL_ARTIFACT
+from engine.core.models.protocol import ProtocolModel
 from engine.core.models.repo import RepoModel, ScopeOverride
 from engine.graphs.build import ARTIFACT_NAME as GRAPH_ARTIFACT
 from engine.graphs.build import build_and_save as build_and_save_graph
@@ -51,6 +56,9 @@ from engine.ingest.build.pipeline import build_and_save
 from engine.ingest.reader import ARTIFACT_NAME, ingest
 from engine.parse.pipeline import ARTIFACT_NAME as CODE_ARTIFACT
 from engine.parse.pipeline import parse_and_save
+from engine.protocol.assemble import finalize as finalize_protocol
+from engine.protocol.assemble import save as save_protocol
+from engine.protocol.understand import understand
 
 # Matches MAX_ARCHIVE_ENTRIES in ingest/materialize.py — an upload is a repo either way.
 MAX_UPLOAD_FILES = 20_000
@@ -175,7 +183,7 @@ def _fatal(exc: FatalError) -> HTTPException:
 
 @app.get("/audits/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "stages": "repository-reader,build,parse,graph"}
+    return {"status": "ok", "stages": "repository-reader,build,parse,graph,protocol"}
 
 
 @app.post("/audits/upload", response_model=IngestResponse)
@@ -464,6 +472,138 @@ def _load_graph(run_id: str) -> GraphModel:
             },
         )
     return load_artifact(GraphModel, artifact)
+
+
+# ── Protocol Understanding (SPEC §7.6, §8) ────────────────────────────────────
+
+
+class ProtocolRequest(BaseModel):
+    """Both flags default off, and that is the architecture, not caution.
+
+    The deterministic model is the product; enrichment and verification are layers a caller
+    opts into. A default-on `enrich` would silently spend an API budget and make the
+    artifact non-comparable to the run before it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enrich: bool = False
+    verify: bool = False
+
+
+@app.post("/audits/{run_id}/protocol", response_model=ProtocolModel)
+def protocol(run_id: str, request: ProtocolRequest | None = None) -> ProtocolModel:
+    """Interpret a run's `CodeModel` + `GraphModel` into a `ProtocolModel`.
+
+    Synchronous like `/graph` and unlike `/build`: the deterministic pass is pure
+    computation over artifacts already on disk. `enrich=true` makes it network-bound, which
+    is exactly why it is opt-in — a caller that sets it has accepted the latency.
+    """
+    options = request or ProtocolRequest()
+    run_dir = default_run_root() / run_id
+    graph_artifact = run_dir / "artifacts" / f"{GRAPH_ARTIFACT}.json"
+    if not graph_artifact.is_file():
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "PROTOCOL_NEEDS_GRAPH",
+                "message": f"Run {run_id} has no graph.",
+                "hint": f"POST /audits/{run_id}/graph first.",
+            },
+        )
+
+    code = get_code(run_id)
+    graph = load_artifact(GraphModel, graph_artifact)
+    repo = _load_repo(run_id)
+
+    try:
+        model = understand(code, graph, repo)
+    except FatalError as exc:
+        raise _fatal(exc) from exc
+
+    if options.enrich:
+        from engine.protocol.enrich import enrich as run_enrichment
+
+        model = finalize_protocol(run_enrichment(model, code), code)
+
+    if options.verify:
+        from engine.protocol.verify import verify as run_forge
+
+        model, _ = run_forge(model, Path(repo.root), run_dir)
+        model = finalize_protocol(model, code)
+
+    save_protocol(model, run_dir)
+    return model
+
+
+@app.get("/audits/{run_id}/protocol", response_model=ProtocolModel)
+def get_protocol(run_id: str) -> ProtocolModel:
+    artifact = default_run_root() / run_id / "artifacts" / f"{PROTOCOL_ARTIFACT}.json"
+    if not artifact.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": f"Run {run_id} has no protocol model.",
+                "hint": f"POST /audits/{run_id}/protocol first.",
+            },
+        )
+    return load_artifact(ProtocolModel, artifact)
+
+
+@app.get("/audits/{run_id}/protocol/summary")
+def protocol_summary(run_id: str) -> dict[str, Any]:
+    """The overview a UI needs, without shipping the whole artifact.
+
+    A `ProtocolModel` for a real repository is megabytes; a progress screen wants a dozen
+    numbers. Everything here is read off the stored artifact — nothing is recomputed, so
+    this view can never disagree with the model it summarizes.
+    """
+    model = get_protocol(run_id)
+    return {
+        "identity": model.identity.model_dump(mode="json"),
+        "summary": model.summary,
+        "archetype": model.archetype,
+        "counts": model.counts,
+        "coverage": model.coverage.model_dump(mode="json"),
+        "confidence": model.confidence_histogram(),
+        "evidence": model.evidence_histogram(),
+        "core_contracts": model.core_contracts[:10],
+        "roles": [
+            {"contract_id": c.contract_id, "name": c.name, "role": c.role.value}
+            for c in sorted(model.contracts, key=lambda c: -c.centrality)[:20]
+        ],
+        "top_risk_surfaces": [
+            {
+                "id": s.id,
+                "kind": s.kind.value,
+                "title": s.title,
+                "priority": s.priority,
+                "targets": s.targets[:4],
+                "agents": s.suggested_agents,
+            }
+            for s in sorted(model.risk_surfaces, key=lambda s: -s.priority)[:10]
+        ],
+        "documentation_conflicts": [
+            {"statement": r.statement, "finding": r.finding, "subjects": r.subject_ids}
+            for r in model.conflicts
+        ],
+        "invariants": [
+            {
+                "label": i.label,
+                "statement": i.statement,
+                "kind": i.kind.value,
+                "status": i.status.value,
+                "targets": i.targets[:4],
+            }
+            for i in model.invariants
+        ],
+        "open_questions": [
+            {"id": g.id, "question": g.question, "blocking": g.blocking}
+            for g in sorted(model.gaps, key=lambda g: (not g.blocking, -g.priority))[:15]
+        ],
+        "enrichment": model.enrichment.model_dump(mode="json"),
+        "notes": model.notes,
+    }
 
 
 @app.get("/audits/{run_id}/build", response_model=BuildModel)

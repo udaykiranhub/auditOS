@@ -127,13 +127,23 @@ run directory; see [.env.example](.env.example) for the full list. Keys are read
 
 ## Running
 
-The engine is a CLI first. Four stages are implemented, each a superset of the last:
+The engine is a CLI first. Five stages are implemented, each a superset of the last:
 
 ```bash
 python -m engine ingest <path | file.zip | git-url>   # → repo.json
 python -m engine build  <path | file.zip | git-url>   # → + build.json
 python -m engine parse  <path | file.zip | git-url>   # → + code.json   (--build to enrich)
 python -m engine graph  <path | file.zip | git-url>   # → + graph.json
+python -m engine protocol <path | file.zip | git-url> # → + protocol.json
+```
+
+`protocol` needs **no API key**: stages 1–15 are deterministic heuristics over the
+`CodeModel` and `GraphModel`. What they cannot answer is recorded as an open question
+rather than guessed. Two optional layers sit on top:
+
+```bash
+python -m engine protocol <path> --enrich   # answer open questions with an LLM
+python -m engine protocol <path> --verify   # run generated Forge invariant tests
 ```
 
 ```
@@ -160,12 +170,17 @@ There is also a **browser harness** — upload a repo and inspect each artifact 
 produced. Two terminals, both from the repository root:
 
 ```bash
-# 1. API (ingest endpoints only — the rest of the pipeline doesn't exist yet)
-engine/.venv/Scripts/python -m uvicorn engine.api.routes:app --reload --port 8000
+# 1. API — http://localhost:8000, docs at /docs
+#    Run from the repository root: `engine` must be importable as a package.
+engine/.venv/Scripts/python -m uvicorn engine.api.routes:app --reload --port 8000   # Windows
+.venv/bin/python -m uvicorn engine.api.routes:app --reload --port 8000              # macOS / Linux
 
 # 2. Frontend — http://localhost:5173, proxies /audits → :8000
 cd frontend && npm run dev
 ```
+
+Check it is alive: `curl http://localhost:8000/audits/health` →
+`{"status":"ok","stages":"repository-reader,build,parse,graph,protocol"}`
 
 The backend is fully usable from the CLI with no frontend running. The frontend is a client of
 the same API a human could `curl` — that is a hard rule, not a convention.
@@ -214,8 +229,10 @@ before the next begins:
 | `ingest/build` — Foundry / solc / Hardhat | `BuildModel` (AST, storage layout) | ✅ |
 | `parse` — tree-sitter + solc AST enrichment | `CodeModel` | ✅ |
 | `graphs` — code property graph, C3, call/storage resolution | `GraphModel` | ✅ |
-| `protocol` — Protocol Understanding | `ProtocolModel` | ⏳ next |
-| `context` → `agents` → `orchestrator` → `validate` → `report` | … → `report.md` | ⏳ |
+| `protocol` — Protocol Understanding (17 stages, deterministic) | `ProtocolModel` | ✅ |
+| `protocol/enrich` — optional LLM enrichment of open questions | `ProtocolModel` (+`PROPOSED` claims) | ✅ |
+| `protocol/verify` — optional Forge invariant verification | `ProtocolModel` (+`VERIFIED`/`REFUTED`) | ✅ |
+| `context` → `agents` → `orchestrator` → `validate` → `report` | … → `report.md` | ⏳ next |
 
 ## Disclaimer
 
