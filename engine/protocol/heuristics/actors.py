@@ -152,12 +152,20 @@ class _Draft:
             # DERIVED: the guards are read off resolved modifiers, not guessed. Which
             # *human* holds the key is unknowable from source and is not claimed.
             confidence=Confidence.DERIVED,
+            # The claim has to cite what it was derived *from*, not a sentence restating
+            # that it was. The capabilities carry the declarations; the actor lifts a few
+            # so that reading the actor alone still leads back to code.
             evidence=[
+                *(
+                    item
+                    for capability in self.capabilities[:3]
+                    for item in capability.evidence[:1]
+                ),
                 heuristic_evidence(
                     DETECTOR,
                     f"{len(self.capabilities)} entrypoints reachable by this authority",
                     ref=sorted(self.contracts)[0] if self.contracts else "",
-                )
+                ),
             ],
         )
 

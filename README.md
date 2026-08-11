@@ -32,7 +32,7 @@ Parser             → CodeModel      contracts, functions, state, modifiers
         ↓
 Graph Engine       → GraphModel     inheritance, calls, storage, imports
         ↓
-Protocol Under.    → ProtocolModel  actors, assets, entry points, value flows
+Protocol Under.    → ProtocolModel  contract profiles, actors, assets, flows, invariants
         ↓
 Context Builder    → ContextBundle  select → rank → compress → dedupe → budget
         ↓
@@ -230,6 +230,7 @@ before the next begins:
 | `parse` — tree-sitter + solc AST enrichment | `CodeModel` | ✅ |
 | `graphs` — code property graph, C3, call/storage resolution | `GraphModel` | ✅ |
 | `protocol` — Protocol Understanding (17 stages, deterministic) | `ProtocolModel` | ✅ |
+| `protocol/heuristics/profiles` — per-contract profiles, function behaviour, permissions | `ProtocolModel.profiles` | ✅ |
 | `protocol/enrich` — optional LLM enrichment of open questions | `ProtocolModel` (+`PROPOSED` claims) | ✅ |
 | `protocol/verify` — optional Forge invariant verification | `ProtocolModel` (+`VERIFIED`/`REFUTED`) | ✅ |
 | `context` → `agents` → `orchestrator` → `validate` → `report` | … → `report.md` | ⏳ next |

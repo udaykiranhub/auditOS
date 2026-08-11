@@ -10,8 +10,10 @@ import type {
   ApiError,
   BuildModel,
   CodeModel,
+  ContractProfile,
   GraphModel,
   IngestResponse,
+  ProfileIndexRow,
   ProtocolSummary,
 } from '../types/repo'
 
@@ -248,5 +250,33 @@ export async function runProtocol(
   // The model itself is megabytes; this screen wants the summary the engine derives from
   // the artifact it just wrote.
   const { data } = await http.get<ProtocolSummary>(`/audits/${runId}/protocol/summary`)
+  return data
+}
+
+/**
+ * The contract-level index (schema 1.2).
+ *
+ * Separate from the summary because the two are read at different times: the summary
+ * answers "what is this protocol", this answers "which contract do I open". Neither
+ * carries the function bodies — `fetchProfile` is the only call that does.
+ */
+export async function fetchProfiles(runId: string): Promise<ProfileIndexRow[]> {
+  const { data } = await http.get<{ profiles: ProfileIndexRow[] }>(
+    `/audits/${runId}/protocol/profiles`,
+  )
+  return data.profiles
+}
+
+/**
+ * One contract in full. `contract` may be a `SolidityID` or a bare contract name.
+ *
+ * The segments are encoded individually: a `SolidityID` is `src/Vault.sol:Vault`, and
+ * percent-encoding its separators would stop the server's `:path` parameter matching.
+ */
+export async function fetchProfile(runId: string, contract: string): Promise<ContractProfile> {
+  const addressed = contract.split('/').map(encodeURIComponent).join('/')
+  const { data } = await http.get<ContractProfile>(
+    `/audits/${runId}/protocol/profiles/${addressed}`,
+  )
   return data
 }

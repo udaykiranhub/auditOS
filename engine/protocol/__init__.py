@@ -23,12 +23,15 @@ from __future__ import annotations
 from engine.core.models.protocol import ARTIFACT_NAME, ProtocolModel
 from engine.protocol.assemble import finalize, load, measure, new_model, save
 from engine.protocol.order import canonicalize
+from engine.protocol.query import ProtocolQuery, ProtocolSlice
 from engine.protocol.validate import ProtocolCode, validate
 
 __all__ = [
     "ARTIFACT_NAME",
     "ProtocolCode",
     "ProtocolModel",
+    "ProtocolQuery",
+    "ProtocolSlice",
     "canonicalize",
     "finalize",
     "load",

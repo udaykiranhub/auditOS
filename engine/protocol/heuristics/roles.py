@@ -9,10 +9,24 @@ is what its contracts do; classifying the repository first and then forcing cont
 that label is how a lending market's staking module gets mislabelled and its bug missed.
 
 **Scoring, not first-match.** Each role is a set of weighted signals — required members,
-supporting members, storage names, standards already detected. A contract gets the
-highest-scoring role plus every other role that cleared the bar, because a `Vault` that is
-also an `ERC20` (its share token) is genuinely both, and dropping the second role loses the
-share-accounting half of every finding.
+supporting members, storage names, standards already detected. A contract gets every role
+that cleared the bar, strongest first, because a `Vault` that is also an `ERC20` (its share
+token) is genuinely both, and dropping the second loses the share-accounting half of every
+finding.
+
+**Two rules keep the scoring honest**, and both exist because the first version failed on
+a real protocol — Arcadia, where 21 of 35 contracts came out as "vault", including its
+price oracles and its registry:
+
+1. **Whole-word matching.** `getUsdValueExposureToUnderlyingAssetAfterDeposit` is not a
+   deposit function, and `assetToAssetInformation` is not a vault's `asset` handle.
+   Substring matching read both as vault signals. Signals now match on camelCase word
+   boundaries, and the defining ones must appear in *prefix* position — a function named
+   for an action performs it; one that merely mentions it usually reports on it.
+2. **Normalized scores.** Raw hit counts reward size: a 40-function registry accumulates
+   more incidental matches than a 6-function vault and outscores it. Each role's score is
+   now its share of the signals that role actually defines, so a small contract matching
+   3 of 4 vault signals beats a large one matching 5 of 20.
 
 Everything here is `INFERRED` unless a standard carried it. Names are evidence of intent and
 nothing more: a contract called `Vault` that lends is a lending market, and the operation
@@ -32,21 +46,46 @@ from engine.core.models.protocol import (
     Component,
     ContractClassification,
     ContractRole,
+    RoleAssignment,
     Standard,
     StandardClaim,
 )
-from engine.protocol.heuristics.signatures import ProtocolIndex
+from engine.protocol.heuristics.signatures import (
+    ProtocolIndex,
+    has_token,
+    starts_with_token,
+)
 from engine.protocol.ids import make_component_id, make_role_id
 
 DETECTOR = "contract_role"
 
-#: A role must clear this to be recorded at all. Below it the signals are coincidental —
-#: one matching function name in a 40-function contract means nothing.
-ROLE_THRESHOLD = 2.0
+#: Normalized share of a role's own signals that must match before the role is recorded.
+#: Below this the matches are incidental — one deposit-shaped name in a registry means
+#: nothing, and admitting it is how 21 of Arcadia's 35 contracts became vaults.
+ROLE_THRESHOLD = 0.34
 
-#: A secondary role must clear this. Higher than the primary bar: a weak second role adds
-#: noise to every downstream stage that iterates roles.
-SECONDARY_THRESHOLD = 3.0
+#: A role beyond the first must clear this. Higher than the primary bar: a weak second role
+#: adds noise to every downstream stage that iterates roles.
+SECONDARY_THRESHOLD = 0.5
+
+#: Roles beyond the primary that are worth carrying. More than this and the list stops
+#: being a classification and becomes a shrug.
+MAX_ROLES = 3
+
+#: Matches that count as full credit for a category. **Enumerating synonyms must not dilute
+#: a role's own score.** Under a `len(signals)` denominator, the well-specified rules lost to
+#: the sketchy ones: Arcadia's `LendingPool` scored 0.29 for `lending_market` — under the
+#: 0.34 bar — because that rule lists six function signals and the pool matches two of them
+#: (`borrow`, `repay`), while `token` scored 0.89 on a single inherited ERC-20 standard. The
+#: pool was therefore classified as a token, and every profile, purpose and invariant built
+#: on that role inherited the mistake.
+#:
+#: A role is evidenced by *a few* of its defining signals appearing, not by all of them, so
+#: the denominator is capped the same way `names` already caps at one. `names` and
+#: `standards` are unchanged: a contract has one name and either implements a standard or
+#: does not.
+EXPECTED_FUNCTIONS = 3
+EXPECTED_STORAGE = 2
 
 
 @dataclass(frozen=True)
@@ -55,144 +94,244 @@ class RoleRule:
 
     role: ContractRole
     functions: tuple[str, ...] = ()
-    """Function *name* fragments (not signatures) — matched against the flattened surface."""
+    """Function *name* fragments (not signatures) — matched as whole words against the
+    inheritance-flattened surface."""
     storage: tuple[str, ...] = ()
     names: tuple[str, ...] = ()
     """Contract-name fragments. Weakest signal, weighted lowest."""
     standards: tuple[Standard, ...] = ()
     requires: tuple[str, ...] = ()
-    """Function-name fragments that MUST all be present. A vault without any deposit-shaped
-    function is not a vault however many `total*` variables it has."""
+    """Defining actions. At least one must appear as a whole-word **prefix** of some
+    exposed function. A vault without any function actually named for depositing is not a
+    vault, however many `total*` variables it has — and `getValueAfterDeposit` does not
+    count, which is the whole reason this is prefix-matched."""
+
+    excluded_by: tuple[ContractRole, ...] = ()
+    """Roles that, when they score higher, make this one implausible rather than secondary.
+    A pricing module scoring above `VAULT` means the deposit-shaped names were valuation
+    hooks; carrying `VAULT` alongside would attach custody semantics to a contract that
+    holds nothing."""
 
     function_weight: float = 1.0
     storage_weight: float = 1.0
-    name_weight: float = 0.75
-    standard_weight: float = 3.0
+    name_weight: float = 1.5
+    """Higher than a single function hit: a contract *named* `ChainlinkOracleModule` is
+    stating its purpose, which is stronger evidence than one incidental method name."""
+    standard_weight: float = 4.0
 
 
 RULES: tuple[RoleRule, ...] = (
+    # ── Roles that must be tested for, because their absence is what made everything
+    # else look like a vault on a real protocol ────────────────────────────────────────
+    RoleRule(
+        ContractRole.PRICING_MODULE,
+        functions=(
+            "getValue",
+            "processDirectDeposit",
+            "processIndirectDeposit",
+            "processDirectWithdrawal",
+            "processIndirectWithdrawal",
+            "getUsdValue",
+            "isAllowed",
+            "getRiskFactors",
+            "getUnderlyingAssets",
+            "getRate",
+            "setRiskParameters",
+        ),
+        storage=("assetToInformation", "riskParams", "exposure", "assetModule", "oracle"),
+        names=("assetmodule", "am", "pricingmodule", "valuation", "adapter"),
+        requires=("getValue", "processDirect", "processIndirect", "getUsdValue", "isAllowed"),
+        excluded_by=(),
+    ),
+    RoleRule(
+        ContractRole.ACCOUNT,
+        functions=(
+            "flashAction",
+            "getAccountValue",
+            "openMarginAccount",
+            "closeMarginAccount",
+            "transferOwnership",
+            "generateAssetData",
+            "getCollateralValue",
+            "isAccountUnhealthy",
+            "isAccountLiquidatable",
+        ),
+        storage=("owner", "creditor", "registry", "erc20Stored", "erc721Stored"),
+        names=("account", "wallet", "position", "safe"),
+        requires=("flashAction", "getAccountValue", "openMarginAccount", "isAccountLiquidatable"),
+    ),
+    RoleRule(
+        ContractRole.GUARDIAN,
+        functions=("pause", "unPause", "unpause", "setPauseFlag", "changeGuardian"),
+        storage=("pauseTimestamp", "guardian", "paused"),
+        names=("guardian",),
+        requires=("pause", "changeGuardian"),
+    ),
+    RoleRule(
+        ContractRole.MIGRATOR,
+        functions=("migrate", "upgradeAccount", "endUpgrade"),
+        names=("migrator", "migration"),
+        requires=("migrate",),
+    ),
+    RoleRule(
+        ContractRole.HOOK,
+        functions=("beforeSwap", "afterSwap", "beforeAddLiquidity", "afterAddLiquidity"),
+        names=("hook",),
+        requires=("beforeSwap", "afterSwap"),
+    ),
     RoleRule(
         ContractRole.VAULT,
-        functions=("deposit", "withdraw", "redeem", "mint", "previewdeposit", "converttoshares"),
-        storage=("totalassets", "totalshares", "shares", "asset", "totalsupply"),
-        names=("vault", "pool4626", "erc4626"),
+        functions=(
+            "deposit",
+            "withdraw",
+            "redeem",
+            "mint",
+            "previewDeposit",
+            "convertToShares",
+            "convertToAssets",
+            "totalAssets",
+        ),
+        storage=("totalAssets", "totalShares", "shares", "asset", "totalSupply"),
+        names=("vault", "erc4626", "tranche"),
         standards=(Standard.ERC4626,),
-        requires=("deposit", "withdraw", "redeem"),
+        requires=("deposit", "withdraw", "redeem", "mint"),
+        # Every valuation adapter in existence has a `processDirectDeposit`; without this
+        # they all read as vaults and inherit custody semantics they have no business with.
+        excluded_by=(ContractRole.PRICING_MODULE, ContractRole.REGISTRY, ContractRole.ORACLE),
     ),
     RoleRule(
         ContractRole.LENDING_MARKET,
-        functions=("borrow", "repay", "supply", "redeemunderlying", "accrueinterest"),
-        storage=("totalborrows", "borrowindex", "reserves", "collateral", "debt"),
-        names=("lend", "ctoken", "atoken", "market", "comptroller", "pool"),
+        functions=("borrow", "repay", "supply", "redeemUnderlying", "accrueInterest", "liquidate"),
+        storage=("totalBorrows", "borrowIndex", "reserves", "collateral", "debt", "realisedDebt"),
+        names=("lending", "ctoken", "atoken", "market", "comptroller", "lendingpool"),
         requires=("borrow", "repay"),
     ),
     RoleRule(
         ContractRole.LIQUIDATION_ENGINE,
-        functions=("liquidate", "liquidationcall", "seize", "healthfactor", "iscollateralized"),
-        storage=("liquidationthreshold", "closefactor", "liquidationbonus", "healthfactor"),
-        names=("liquidat",),
-        requires=("liquidat",),
+        functions=(
+            "liquidate",
+            "liquidationCall",
+            "seize",
+            "healthFactor",
+            "isCollateralized",
+            "auction",
+        ),
+        storage=("liquidationThreshold", "closeFactor", "liquidationBonus", "healthFactor"),
+        names=("liquidator", "liquidation", "auction"),
+        requires=("liquidate", "liquidationCall", "startAuction"),
     ),
     RoleRule(
         ContractRole.POOL,
-        functions=("swap", "getreserves", "addliquidity", "removeliquidity", "mint", "burn"),
-        storage=("reserve0", "reserve1", "kLast", "liquidity", "sqrtprice"),
+        functions=("swap", "getReserves", "addLiquidity", "removeLiquidity", "mint", "burn"),
+        storage=("reserve0", "reserve1", "kLast", "liquidity", "sqrtPrice"),
         names=("pair", "pool", "amm", "curve"),
         requires=("swap",),
     ),
     RoleRule(
         ContractRole.ROUTER,
-        functions=("swapexacttokensfor", "swaptokensforexact", "quote", "getamountsout",
-                   "addliquidity", "multicall"),
+        functions=("swapExactTokensFor", "swapTokensForExact", "quote", "getAmountsOut",
+                   "addLiquidity", "multicall"),
         names=("router", "aggregator", "zap"),
         requires=("swap",),
     ),
     RoleRule(
         ContractRole.ORACLE,
-        functions=("latestanswer", "latestrounddata", "getprice", "price", "consult", "peek"),
-        storage=("pricefeed", "aggregator", "twap", "observations"),
-        names=("oracle", "pricefeed", "aggregator"),
-        requires=("price", "answer", "peek", "consult"),
+        functions=(
+            "latestAnswer",
+            "latestRoundData",
+            "getPrice",
+            "getRate",
+            "consult",
+            "peek",
+            "addOracle",
+            "isActive",
+            "decommissionOracle",
+        ),
+        storage=("priceFeed", "aggregator", "twap", "observations", "oracleInformation"),
+        names=("oracle", "pricefeed", "aggregator", "om", "chainlink", "redstone", "pyth"),
+        requires=("getPrice", "latestAnswer", "latestRoundData", "peek", "consult", "addOracle"),
     ),
     RoleRule(
         ContractRole.STAKING,
-        functions=("stake", "unstake", "withdraw", "getreward", "earned", "exit"),
-        storage=("rewardpertokenstored", "rewardrate", "periodfinish", "staked"),
+        functions=("stake", "unstake", "getReward", "earned", "exit", "claimReward"),
+        storage=("rewardPerTokenStored", "rewardRate", "periodFinish", "staked"),
         names=("staking", "stake", "gauge"),
         requires=("stake",),
     ),
     RoleRule(
         ContractRole.REWARD_DISTRIBUTOR,
-        functions=("claim", "getreward", "notifyrewardamount", "distribute", "accrue"),
-        storage=("rewards", "merkleroot", "claimed", "rewardpertoken"),
+        functions=("claim", "getReward", "notifyRewardAmount", "distribute", "accrue"),
+        storage=("rewards", "merkleRoot", "claimed", "rewardPerToken"),
         names=("reward", "distributor", "merkle", "airdrop"),
-        requires=("claim", "distribute", "getreward"),
+        requires=("claim", "distribute", "getReward"),
     ),
     RoleRule(
         ContractRole.GOVERNANCE,
-        functions=("propose", "castvote", "execute", "queue", "state", "quorum"),
-        storage=("proposals", "votes", "quorum", "votingdelay", "votingperiod"),
+        functions=("propose", "castVote", "execute", "queue", "quorum"),
+        storage=("proposals", "votes", "quorum", "votingDelay", "votingPeriod"),
         names=("governor", "governance", "voting"),
-        requires=("propose", "castvote"),
+        requires=("propose", "castVote"),
     ),
     RoleRule(
         ContractRole.TIMELOCK,
-        functions=("schedule", "queuetransaction", "executetransaction", "cancel", "delay"),
-        storage=("delay", "queuedtransactions", "mindelay", "timestamps"),
+        functions=("schedule", "queueTransaction", "executeTransaction", "cancel", "delay"),
+        storage=("delay", "queuedTransactions", "minDelay", "timestamps"),
         names=("timelock",),
-        requires=("delay", "schedule", "queue"),
+        requires=("schedule", "queueTransaction"),
     ),
     RoleRule(
         ContractRole.BRIDGE,
-        functions=("bridge", "deposit", "finalizewithdrawal", "relaymessage", "provehash",
-                   "sendmessage", "receivemessage"),
-        storage=("nonce", "processed", "messages", "remotechain", "domain"),
+        functions=("bridge", "finalizeWithdrawal", "relayMessage", "proveHash",
+                   "sendMessage", "receiveMessage"),
+        storage=("nonce", "processed", "messages", "remoteChain", "domain"),
         names=("bridge", "portal", "messenger", "crosschain", "l1", "l2"),
-        requires=("bridge", "relay", "message"),
+        requires=("bridge", "relayMessage", "sendMessage", "receiveMessage"),
     ),
     RoleRule(
         ContractRole.TOKEN,
-        functions=("transfer", "approve", "balanceof", "totalsupply"),
-        storage=("balanceof", "allowance", "totalsupply"),
+        functions=("transfer", "approve", "balanceOf", "totalSupply", "allowance"),
+        storage=("balanceOf", "allowance", "totalSupply"),
         names=("token", "erc20", "coin"),
         standards=(Standard.ERC20,),
         requires=("transfer",),
     ),
     RoleRule(
         ContractRole.FACTORY,
-        functions=("create", "deploy", "createpair", "clone", "getpair"),
-        storage=("allpairs", "deployed", "implementation", "getpair"),
+        functions=("createAccount", "createPair", "deploy", "clone", "getPair"),
+        storage=("allPairs", "deployed", "implementation", "getPair", "accountIndex"),
         names=("factory", "deployer", "creator"),
-        requires=("create", "deploy", "clone"),
+        requires=("createAccount", "createPair", "deploy", "clone"),
     ),
     RoleRule(
         ContractRole.REGISTRY,
-        functions=("register", "set", "get", "add", "remove", "islisted"),
-        storage=("registry", "whitelist", "allowlist", "registered"),
+        functions=("addAsset", "isAllowed", "getAssetModule", "batchProcessDeposit",
+                   "batchProcessWithdrawal", "addAssetModule", "addOracleModule"),
+        storage=("registry", "whitelist", "allowlist", "assetToAssetInformation",
+                 "isAssetModule", "isOracleModule"),
         names=("registry", "whitelist", "addressprovider", "resolver"),
-        requires=("register", "islisted"),
+        requires=("addAsset", "addAssetModule", "addOracleModule", "batchProcessDeposit"),
     ),
     RoleRule(
         ContractRole.STRATEGY,
         functions=("harvest", "invest", "divest", "rebalance", "report", "tend"),
-        storage=("want", "strategist", "vault", "lastharvest"),
+        storage=("want", "strategist", "vault", "lastHarvest"),
         names=("strategy", "strat", "adapter"),
         requires=("harvest", "invest", "rebalance"),
     ),
     RoleRule(
         ContractRole.ESCROW,
-        functions=("lock", "unlock", "release", "claim", "vest"),
-        storage=("locked", "unlocktime", "vesting", "cliff"),
-        names=("escrow", "vesting", "lock", "timelockedtoken"),
+        functions=("lock", "unlock", "release", "vest"),
+        storage=("locked", "unlockTime", "vesting", "cliff"),
+        names=("escrow", "vesting"),
         requires=("lock", "vest", "release"),
     ),
     RoleRule(
         ContractRole.ACCESS_CONTROL,
-        functions=("hasrole", "grantrole", "revokerole", "transferownership"),
+        functions=("hasRole", "grantRole", "revokeRole", "transferOwnership"),
         storage=("roles", "owner", "admin"),
         names=("access", "auth", "roles", "acl"),
         standards=(Standard.ACCESS_CONTROL,),
-        requires=("role", "owner"),
+        requires=("hasRole", "grantRole", "transferOwnership"),
     ),
 )
 
@@ -205,19 +344,15 @@ def classify(index: ProtocolIndex, standards: list[StandardClaim]) -> list[Contr
 
     classifications: list[ContractClassification] = []
     for contract in index.audited:
-        scores = _score(index, contract, by_contract.get(contract.id, []))
-        ranked = sorted(scores.items(), key=lambda item: (-item[1][0], item[0].value))
-
-        primary, secondary = _pick(ranked)
-        top_evidence = scores.get(primary, (0.0, []))[1]
+        scored = _score(index, contract, by_contract.get(contract.id, []))
+        roles = _pick(scored)
 
         classifications.append(
             ContractClassification(
                 id=make_role_id(contract.id),
                 contract_id=contract.id,
                 name=contract.name,
-                role=primary,
-                secondary_roles=secondary,
+                roles=roles,
                 is_upgradeable=_is_upgradeable(index, contract, by_contract.get(contract.id, [])),
                 is_pausable=any(
                     c.standard is Standard.PAUSABLE for c in by_contract.get(contract.id, [])
@@ -225,9 +360,14 @@ def classify(index: ProtocolIndex, standards: list[StandardClaim]) -> list[Contr
                 is_entry_contract=bool(index.entrypoints_of(contract)),
                 holds_funds=_holds_funds(index, contract),
                 centrality=index.centrality_of(contract.id),
-                confidence=Confidence.INFERRED,
-                evidence=top_evidence
-                or [heuristic_evidence(DETECTOR, "no role signals matched", ref=contract.id)],
+                confidence=Confidence.INFERRED if roles else Confidence.UNKNOWN,
+                evidence=list(roles[0].evidence)
+                if roles
+                else [
+                    heuristic_evidence(
+                        DETECTOR, "no role signals matched this contract", ref=contract.id
+                    )
+                ],
             )
         )
     return classifications
@@ -235,77 +375,132 @@ def classify(index: ProtocolIndex, standards: list[StandardClaim]) -> list[Contr
 
 def _score(
     index: ProtocolIndex, contract: Contract, standards: list[StandardClaim]
-) -> dict[ContractRole, tuple[float, list[Evidence]]]:
-    surface = {name.lower() for name in index.exposed(contract.id)}
-    storage = {name.lower() for name in index.state_vars(contract.id)}
-    contract_name = contract.name.lower()
+) -> list[RoleAssignment]:
+    """Every role that matched, scored as a *share of that role's own signals*.
+
+    Normalizing by the rule's own size is what stops a large contract winning every role
+    by accumulating incidental hits: matching 3 of a vault's 4 defining actions beats
+    matching 5 of a registry's 20 supporting names, which is the right way round and is
+    not what raw counts produce.
+    """
+    surface = list(index.exposed(contract.id))
+    storage = list(index.state_vars(contract.id))
     compliant = {
         claim.standard
         for claim in standards
         if claim.compliance in (Compliance.COMPLIANT, Compliance.PARTIAL, Compliance.DIVERGENT)
     }
 
-    scores: dict[ContractRole, tuple[float, list[Evidence]]] = {}
+    assignments: list[RoleAssignment] = []
     for rule in RULES:
+        # The defining action must appear in *prefix* position on some exposed function.
+        # `getUsdValueAfterDeposit` mentions depositing; it does not do it.
         if rule.requires and not any(
-            _any_contains(surface, needle) for needle in rule.requires
+            _has_prefix(surface, needle) for needle in rule.requires
         ):
-            continue  # the defining behaviour is absent; nothing else can compensate
+            continue
 
-        total = 0.0
+        earned = 0.0
+        available = 0.0
         evidence: list[Evidence] = []
 
-        hits = [needle for needle in rule.functions if _any_contains(surface, needle)]
-        if hits:
-            total += rule.function_weight * len(hits)
-            evidence.append(
-                heuristic_evidence(
-                    DETECTOR, f"exposes {', '.join(hits[:5])}", ref=contract.id
+        if rule.functions:
+            hits = [needle for needle in rule.functions if _matches(surface, needle)]
+            available += rule.function_weight * min(len(rule.functions), EXPECTED_FUNCTIONS)
+            earned += rule.function_weight * min(len(hits), EXPECTED_FUNCTIONS)
+            if hits:
+                evidence.append(
+                    heuristic_evidence(
+                        DETECTOR,
+                        f"exposes {', '.join(hits[:5])} ({len(hits)}/{len(rule.functions)})",
+                        ref=contract.id,
+                    )
+                )
+
+        if rule.storage:
+            storage_hits = [needle for needle in rule.storage if _matches(storage, needle)]
+            available += rule.storage_weight * min(len(rule.storage), EXPECTED_STORAGE)
+            earned += rule.storage_weight * min(len(storage_hits), EXPECTED_STORAGE)
+            if storage_hits:
+                evidence.append(
+                    heuristic_evidence(
+                        DETECTOR, f"stores {', '.join(storage_hits[:5])}", ref=contract.id
+                    )
+                )
+
+        if rule.names:
+            name_hits = [
+                needle for needle in rule.names if needle in contract.name.lower()
+            ]
+            # A contract name states one purpose, so only the best hit counts toward the
+            # denominator — otherwise a rule listing eight aliases is unwinnable on names.
+            available += rule.name_weight
+            earned += rule.name_weight if name_hits else 0.0
+            if name_hits:
+                evidence.append(
+                    heuristic_evidence(DETECTOR, f"named for {name_hits[0]}", ref=contract.id)
+                )
+
+        if rule.standards:
+            standard_hits = [s for s in rule.standards if s in compliant]
+            available += rule.standard_weight
+            earned += rule.standard_weight if standard_hits else 0.0
+            if standard_hits:
+                evidence.append(
+                    heuristic_evidence(
+                        DETECTOR,
+                        f"implements {', '.join(s.value for s in standard_hits)}",
+                        ref=contract.id,
+                    )
+                )
+
+        score = earned / available if available else 0.0
+        if score > 0:
+            assignments.append(
+                RoleAssignment(
+                    role=rule.role,
+                    score=round(score, 4),
+                    rationale=f"{round(score * 100)}% of the signals that define this role",
+                    confidence=Confidence.INFERRED,
+                    evidence=evidence,
                 )
             )
-
-        storage_hits = [needle for needle in rule.storage if _any_contains(storage, needle)]
-        if storage_hits:
-            total += rule.storage_weight * len(storage_hits)
-            evidence.append(
-                heuristic_evidence(
-                    DETECTOR, f"stores {', '.join(storage_hits[:5])}", ref=contract.id
-                )
-            )
-
-        name_hits = [needle for needle in rule.names if needle in contract_name]
-        if name_hits:
-            total += rule.name_weight * len(name_hits)
-            evidence.append(
-                heuristic_evidence(DETECTOR, f"named for {name_hits[0]}", ref=contract.id)
-            )
-
-        standard_hits = [s for s in rule.standards if s in compliant]
-        if standard_hits:
-            total += rule.standard_weight * len(standard_hits)
-            evidence.append(
-                heuristic_evidence(
-                    DETECTOR,
-                    f"implements {', '.join(s.value for s in standard_hits)}",
-                    ref=contract.id,
-                )
-            )
-
-        if total > 0:
-            scores[rule.role] = (total, evidence)
-    return scores
+    return assignments
 
 
-def _pick(
-    ranked: list[tuple[ContractRole, tuple[float, list[Evidence]]]],
-) -> tuple[ContractRole, list[ContractRole]]:
-    if not ranked or ranked[0][1][0] < ROLE_THRESHOLD:
-        return ContractRole.UNKNOWN, []
-    primary = ranked[0][0]
-    secondary = [
-        role for role, (score, _) in ranked[1:] if score >= SECONDARY_THRESHOLD
-    ]
-    return primary, secondary
+def _pick(scored: list[RoleAssignment]) -> list[RoleAssignment]:
+    """Rank, drop the incidental, and remove roles a stronger one rules out."""
+    ranked = sorted(scored, key=lambda a: (-a.score, a.role.value))
+    ranked = [a for a in ranked if a.score >= ROLE_THRESHOLD]
+    if not ranked:
+        return []
+
+    excluders = {a.role for a in ranked}
+    kept: list[RoleAssignment] = []
+    for position, assignment in enumerate(ranked):
+        rule = _RULE_BY_ROLE.get(assignment.role)
+        if rule is not None and any(
+            other in excluders
+            and any(o.role is other and o.score > assignment.score for o in ranked)
+            for other in rule.excluded_by
+        ):
+            continue  # a stronger role makes this one implausible, not merely secondary
+        if position > 0 and assignment.score < SECONDARY_THRESHOLD:
+            continue
+        kept.append(assignment)
+    return kept[:MAX_ROLES]
+
+
+_RULE_BY_ROLE: dict[ContractRole, RoleRule] = {rule.role: rule for rule in RULES}
+
+
+def _matches(names: list[str], needle: str) -> bool:
+    """Whole-word containment across a set of member names."""
+    return any(has_token(name, needle) for name in names)
+
+
+def _has_prefix(names: list[str], needle: str) -> bool:
+    return any(starts_with_token(name, needle) for name in names)
 
 
 def _is_upgradeable(
@@ -356,8 +551,6 @@ def _holds_funds(index: ProtocolIndex, contract: Contract) -> bool:
     )
 
 
-def _any_contains(haystack: set[str], needle: str) -> bool:
-    return any(needle in item for item in haystack)
 
 
 # ── Stage 1: protocol archetype, derived from the roles ───────────────────────
@@ -380,6 +573,10 @@ ROLE_TO_ARCHETYPE: dict[ContractRole, tuple[Archetype, float]] = {
     ContractRole.STRATEGY: (Archetype.YIELD_AGGREGATOR, 0.8),
     ContractRole.ESCROW: (Archetype.ESCROW, 0.7),
     ContractRole.REGISTRY: (Archetype.REGISTRY, 0.3),
+    # A per-user smart account with a creditor is the shape of isolated-margin lending;
+    # weighted low because the same shape also appears in plain account abstraction.
+    ContractRole.ACCOUNT: (Archetype.ACCOUNT_ABSTRACTION, 0.5),
+    ContractRole.PRICING_MODULE: (Archetype.ORACLE, 0.3),
 }
 
 #: Archetypes below this share of the total signal are dropped: every protocol has *some*

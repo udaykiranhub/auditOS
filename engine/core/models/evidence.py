@@ -48,6 +48,16 @@ class Confidence(StrEnum):
     more than one that reports `INFERRED` honestly.
     """
 
+    UNKNOWN = "unknown"
+    """No determination was reached. Distinct from every other member, including `REFUTED`:
+    a refutation is a *finding*, an unknown is the absence of one.
+
+    This exists because the alternative — leaving a field at its type default — makes an
+    absence indistinguishable from an observation. `Asset.is_fee_on_transfer = False` on an
+    external token is not a finding that it does not charge a fee; it is a field nobody
+    filled in, and downstream that difference decides whether a conservation invariant is
+    sound. A claim marked `UNKNOWN` should be paired with a `SemanticGap`."""
+
     REFUTED = "refuted"
     """An explicit check disagreed. Kept, never deleted — a refuted claim is a fact about
     the protocol and stops the same wrong guess being re-proposed."""
@@ -90,12 +100,13 @@ class Confidence(StrEnum):
 
 
 _RANKS: dict[Confidence, int] = {
-    Confidence.REFUTED: 0,
-    Confidence.PROPOSED: 1,
-    Confidence.INFERRED: 2,
-    Confidence.DERIVED: 3,
-    Confidence.STATED: 4,
-    Confidence.VERIFIED: 5,
+    Confidence.UNKNOWN: 0,
+    Confidence.REFUTED: 1,
+    Confidence.PROPOSED: 2,
+    Confidence.INFERRED: 3,
+    Confidence.DERIVED: 4,
+    Confidence.STATED: 5,
+    Confidence.VERIFIED: 6,
 }
 
 

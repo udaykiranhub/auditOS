@@ -93,6 +93,50 @@ def test_the_summary_is_far_smaller_than_the_model(client: TestClient, foundry_p
     assert len(json.dumps(summary)) < len(json.dumps(model))
 
 
+def test_the_profile_index_lists_every_contract(client: TestClient, foundry_project: Path):
+    run_id = _run(client, foundry_project)
+    client.post(f"/audits/{run_id}/parse")
+    client.post(f"/audits/{run_id}/graph")
+    model = client.post(f"/audits/{run_id}/protocol").json()
+
+    listed = client.get(f"/audits/{run_id}/protocol/profiles").json()["profiles"]
+
+    assert len(listed) == len(model["profiles"])
+    assert all(row["name"] for row in listed)
+    # Ranked, so the first row is the contract a reader should open first.
+    assert [row["centrality"] for row in listed] == sorted(
+        (row["centrality"] for row in listed), reverse=True
+    )
+
+
+def test_one_profile_is_served_in_full_by_name_or_id(
+    client: TestClient, foundry_project: Path
+):
+    run_id = _run(client, foundry_project)
+    client.post(f"/audits/{run_id}/parse")
+    client.post(f"/audits/{run_id}/graph")
+    model = client.post(f"/audits/{run_id}/protocol").json()
+    expected = model["profiles"][0]
+
+    by_id = client.get(f"/audits/{run_id}/protocol/profiles/{expected['contract_id']}")
+    by_name = client.get(f"/audits/{run_id}/protocol/profiles/{expected['name']}")
+
+    assert by_id.status_code == 200
+    assert by_id.json() == expected
+    assert by_name.json()["contract_id"] == expected["contract_id"]
+    # The detail view is the one place the function bodies are served.
+    assert "functions" in by_id.json()
+
+
+def test_an_unknown_profile_is_404(client: TestClient, foundry_project: Path):
+    run_id = _run(client, foundry_project)
+    client.post(f"/audits/{run_id}/parse")
+    client.post(f"/audits/{run_id}/graph")
+    client.post(f"/audits/{run_id}/protocol")
+
+    assert client.get(f"/audits/{run_id}/protocol/profiles/NoSuchThing").status_code == 404
+
+
 def test_protocol_before_it_is_built_is_404(client: TestClient, foundry_project: Path):
     run_id = _run(client, foundry_project)
     assert client.get(f"/audits/{run_id}/protocol").status_code == 404

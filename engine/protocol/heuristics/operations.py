@@ -41,7 +41,7 @@ from engine.core.models.protocol import (
     StateItem,
     StateTransition,
 )
-from engine.protocol.heuristics.signatures import ProtocolIndex
+from engine.protocol.heuristics.signatures import ProtocolIndex, starts_with_token
 from engine.protocol.ids import make_operation_id
 
 DETECTOR = "operation_model"
@@ -50,20 +50,20 @@ DETECTOR = "operation_model"
 #: more specific wins: `withdrawAll` is a WITHDRAW, but `removeLiquidity` must not be read
 #: as a REMOVE that happens to contain "move".
 KIND_BY_PREFIX: tuple[tuple[str, OperationKind], ...] = (
-    ("depositfor", OperationKind.DEPOSIT),
+    ("depositFor", OperationKind.DEPOSIT),
     ("deposit", OperationKind.DEPOSIT),
     ("supply", OperationKind.DEPOSIT),
-    ("addliquidity", OperationKind.ADD_LIQUIDITY),
-    ("removeliquidity", OperationKind.REMOVE_LIQUIDITY),
+    ("addLiquidity", OperationKind.ADD_LIQUIDITY),
+    ("removeLiquidity", OperationKind.REMOVE_LIQUIDITY),
     ("withdraw", OperationKind.WITHDRAW),
     ("redeem", OperationKind.REDEEM),
     ("borrow", OperationKind.BORROW),
     ("repay", OperationKind.REPAY),
     ("liquidate", OperationKind.LIQUIDATE),
-    ("swapexact", OperationKind.SWAP),
+    ("swapExact", OperationKind.SWAP),
     ("swap", OperationKind.SWAP),
     ("exchange", OperationKind.SWAP),
-    ("flashloan", OperationKind.FLASH_LOAN),
+    ("flashLoan", OperationKind.FLASH_LOAN),
     ("flash", OperationKind.FLASH_LOAN),
     ("stake", OperationKind.STAKE),
     ("unstake", OperationKind.UNSTAKE),
@@ -71,9 +71,9 @@ KIND_BY_PREFIX: tuple[tuple[str, OperationKind], ...] = (
     ("rebalance", OperationKind.REBALANCE),
     ("compound", OperationKind.HARVEST),
     ("claim", OperationKind.CLAIM),
-    ("getreward", OperationKind.CLAIM),
+    ("getReward", OperationKind.CLAIM),
     ("propose", OperationKind.PROPOSE),
-    ("castvote", OperationKind.VOTE),
+    ("castVote", OperationKind.VOTE),
     ("vote", OperationKind.VOTE),
     ("queue", OperationKind.EXECUTE),
     ("execute", OperationKind.EXECUTE),
@@ -81,14 +81,14 @@ KIND_BY_PREFIX: tuple[tuple[str, OperationKind], ...] = (
     ("send", OperationKind.BRIDGE_SEND),
     ("relay", OperationKind.BRIDGE_RECEIVE),
     ("finalize", OperationKind.BRIDGE_RECEIVE),
-    ("transferfrom", OperationKind.TRANSFER),
+    ("transferFrom", OperationKind.TRANSFER),
     ("transfer", OperationKind.TRANSFER),
     ("approve", OperationKind.APPROVE),
     ("permit", OperationKind.APPROVE),
     ("mint", OperationKind.MINT),
     ("burn", OperationKind.BURN),
     ("initialize", OperationKind.INITIALIZE),
-    ("upgradeto", OperationKind.UPGRADE),
+    ("upgradeTo", OperationKind.UPGRADE),
     ("upgrade", OperationKind.UPGRADE),
     ("pause", OperationKind.PAUSE),
     ("unpause", OperationKind.PAUSE),
@@ -231,13 +231,16 @@ def classify_kind(function: Function) -> OperationKind:
     `deposit` in a governance contract is not a deposit, and nothing here can tell. The
     flow and transition stages are what would contradict it, which is why the label and the
     structure carry separate confidences.
+
+    Matched on whole camelCase words rather than a raw string prefix, and views are settled
+    first. `setPauseFlag` is a configuration change, not a pause; `getDepositValue` is a
+    view, not a deposit — and a lowercase-run prefix match calls both wrongly.
     """
-    name = function.name.lower().replace("_", "")
-    for prefix, kind in KIND_BY_PREFIX:
-        if name.startswith(prefix):
-            return kind
     if function.mutability in ("view", "pure"):
         return OperationKind.VIEW
+    for prefix, kind in KIND_BY_PREFIX:
+        if starts_with_token(function.name, prefix):
+            return kind
     return OperationKind.UNKNOWN
 
 
@@ -329,5 +332,76 @@ def link(
         operation.flow_ids = sorted(flows_by_operation.get(operation.id, []))
         operation.transition_ids = sorted(transitions_by_operation.get(operation.id, []))
 
+    _link_related(operations)
 
-__all__ = ["KIND_BY_PREFIX", "classify_kind", "detect", "link", "preconditions"]
+
+#: Operations that must be reasoned about together. Every accounting bug lives in the gap
+#: between an operation and its inverse, so a retrieval that returns one without the other
+#: hands an agent half a system and asks it to find the imbalance.
+INVERSE_KINDS: dict[OperationKind, tuple[OperationKind, ...]] = {
+    OperationKind.DEPOSIT: (OperationKind.WITHDRAW, OperationKind.REDEEM),
+    OperationKind.WITHDRAW: (OperationKind.DEPOSIT, OperationKind.MINT),
+    OperationKind.REDEEM: (OperationKind.DEPOSIT, OperationKind.MINT),
+    OperationKind.MINT: (OperationKind.BURN, OperationKind.REDEEM),
+    OperationKind.BURN: (OperationKind.MINT, OperationKind.DEPOSIT),
+    OperationKind.BORROW: (OperationKind.REPAY, OperationKind.LIQUIDATE),
+    OperationKind.REPAY: (OperationKind.BORROW,),
+    OperationKind.LIQUIDATE: (OperationKind.BORROW, OperationKind.REPAY),
+    OperationKind.STAKE: (OperationKind.UNSTAKE, OperationKind.CLAIM),
+    OperationKind.UNSTAKE: (OperationKind.STAKE,),
+    OperationKind.CLAIM: (OperationKind.STAKE, OperationKind.HARVEST),
+    OperationKind.ADD_LIQUIDITY: (OperationKind.REMOVE_LIQUIDITY,),
+    OperationKind.REMOVE_LIQUIDITY: (OperationKind.ADD_LIQUIDITY,),
+    OperationKind.BRIDGE_SEND: (OperationKind.BRIDGE_RECEIVE,),
+    OperationKind.BRIDGE_RECEIVE: (OperationKind.BRIDGE_SEND,),
+}
+
+#: Cap per operation. Beyond this the list stops being "what else to read" and becomes the
+#: whole contract, which is what the retrieval is supposed to avoid.
+MAX_RELATED = 8
+
+
+def _link_related(operations: list[Operation]) -> None:
+    """Two ways an operation relates to another, both evidence-backed.
+
+    *Inverse by kind* — a deposit and the withdraw that undoes it. *Shared critical state* —
+    two operations writing the same accounting variable are coupled whether or not their
+    names suggest it, and that coupling is read straight off the state model rather than
+    guessed.
+    """
+    by_contract: dict[str, list[Operation]] = {}
+    for operation in operations:
+        by_contract.setdefault(operation.contract_id or "", []).append(operation)
+
+    for operation in operations:
+        if operation.is_view:
+            continue
+        peers = by_contract.get(operation.contract_id or "", [])
+        related: set[str] = set()
+
+        inverses = INVERSE_KINDS.get(operation.kind, ())
+        related.update(
+            peer.id for peer in peers if peer.kind in inverses and peer.id != operation.id
+        )
+
+        written = set(operation.writes)
+        if written:
+            related.update(
+                peer.id
+                for peer in peers
+                if peer.id != operation.id
+                and not peer.is_view
+                and written & set(peer.writes)
+            )
+
+        operation.related_operations = sorted(related)[:MAX_RELATED]
+
+
+__all__ = [
+    "INVERSE_KINDS",
+    "KIND_BY_PREFIX",
+    "classify_kind",
+    "detect",
+    "link",
+    "preconditions",
+]

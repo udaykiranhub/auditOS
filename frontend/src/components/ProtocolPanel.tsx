@@ -14,11 +14,19 @@
  * Nothing is re-derived in the browser. Every number comes off the artifact.
  */
 
+import { useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
-import type { ClaimConfidence, ProtocolSummary } from '../types/repo'
+import { fetchProfile, fetchProfiles } from '../api/client'
+import type { ClaimConfidence, FunctionBehavior, ProtocolSummary } from '../types/repo'
 
 /** The ladder, weakest first. Colour tracks *how the claim was made*, not how alarming it is. */
 const CONFIDENCE: { key: ClaimConfidence; label: string; color: string; hint: string }[] = [
+  {
+    key: 'unknown',
+    label: 'unknown',
+    color: 'var(--text-muted)',
+    hint: 'No determination was reached. An absence, not an observation — paired with an open question.',
+  },
   {
     key: 'refuted',
     label: 'refuted',
@@ -65,7 +73,19 @@ const STATUS_COLOR: Record<string, string> = {
   unverifiable: 'var(--text-muted)',
 }
 
-type Tab = 'overview' | 'invariants' | 'risk' | 'limits'
+type Tab = 'overview' | 'contracts' | 'invariants' | 'risk' | 'limits'
+
+/** Effect kind → how it reads in the sequence. Colour marks where control leaves the frame. */
+const STEP_STYLE: Record<string, { glyph: string; color: string }> = {
+  check: { glyph: 'CHECK', color: 'var(--series-4)' },
+  read: { glyph: 'READ', color: 'var(--text-muted)' },
+  calculate: { glyph: 'CALC', color: 'var(--text-muted)' },
+  write: { glyph: 'WRITE', color: 'var(--series-2)' },
+  internal_call: { glyph: 'CALL', color: 'var(--text-secondary)' },
+  external_call: { glyph: 'EXT', color: 'var(--status-critical)' },
+  transfer: { glyph: 'XFER', color: 'var(--status-critical)' },
+  create: { glyph: 'NEW', color: 'var(--status-critical)' },
+}
 
 function short(id: string): string {
   const [path, member] = id.split(':')
@@ -112,7 +132,226 @@ function Stat({ label, value }: { label: string; value: number | string }) {
   )
 }
 
-export default function ProtocolPanel({ protocol }: { protocol: ProtocolSummary }) {
+/**
+ * One function body as an ordered sequence.
+ *
+ * The order is the content. An unordered list of the same reads, writes and calls cannot
+ * distinguish a write before an external call from a write after one, and that distinction
+ * is the entire question for a reentrancy reader.
+ */
+function BehaviorRow({ fn }: { fn: FunctionBehavior }) {
+  const [open, setOpen] = useState(false)
+  const risky = fn.writes_after_external_call.length > 0
+
+  return (
+    <li style={{ borderTop: '1px solid var(--border)' }}>
+      <button
+        type="button"
+        onClick={() => setOpen(!open)}
+        className="flex w-full items-baseline gap-2 py-1.5 text-left"
+      >
+        <span className="mono text-[11px]">{fn.signature || fn.name}</span>
+        {fn.is_privileged && (
+          <span
+            className="mono rounded px-1 text-[9px]"
+            title={`gated by ${fn.caller_requirements.join(', ')}`}
+            style={{
+              background: 'color-mix(in srgb, var(--series-4) 18%, transparent)',
+              color: 'var(--series-4)',
+            }}
+          >
+            {fn.caller_requirements[0] ?? 'guarded'}
+          </span>
+        )}
+        {fn.is_view && (
+          <span className="mono text-[9px]" style={{ color: 'var(--text-muted)' }}>
+            view
+          </span>
+        )}
+        {/* A candidate to investigate, never a finding: a guard may well cover it. */}
+        {risky && (
+          <span
+            className="mono rounded px-1 text-[9px]"
+            title="writes state after control left the frame — a place to look, not a verdict"
+            style={{
+              background: 'color-mix(in srgb, var(--status-critical) 14%, transparent)',
+              color: 'var(--status-critical)',
+            }}
+          >
+            writes after external call
+          </span>
+        )}
+      </button>
+
+      {open && (
+        <div className="pb-3 pl-3 text-[11px]" style={{ color: 'var(--text-secondary)' }}>
+          {fn.purpose && <p className="mb-2">{fn.purpose}</p>}
+          {fn.documented_purpose && (
+            <p className="mb-2" style={{ color: 'var(--text-muted)' }}>
+              docs: “{fn.documented_purpose}”
+            </p>
+          )}
+          <ol className="flex flex-col gap-0.5">
+            {fn.steps.map((step, i) => {
+              const style = STEP_STYLE[step.kind] ?? STEP_STYLE.read
+              return (
+                <li key={`${step.order}-${i}`} className="mono flex gap-2 text-[10px]">
+                  <span className="w-12 shrink-0" style={{ color: style.color }}>
+                    {style.glyph}
+                  </span>
+                  <span className="truncate">{step.detail || short(step.target)}</span>
+                </li>
+              )
+            })}
+          </ol>
+          {fn.steps_truncated > 0 && (
+            <p className="mt-1 text-[10px]" style={{ color: 'var(--status-warning)' }}>
+              +{fn.steps_truncated} further steps not shown — this sequence is a prefix.
+            </p>
+          )}
+        </div>
+      )}
+    </li>
+  )
+}
+
+/** The contract-level view. Fetched per contract, because the bodies are the bulk of it. */
+function ContractsTab({ runId }: { runId: string }) {
+  const [selected, setSelected] = useState<string | null>(null)
+
+  const index = useQuery({
+    queryKey: ['profiles', runId],
+    queryFn: () => fetchProfiles(runId),
+  })
+  const detail = useQuery({
+    queryKey: ['profile', runId, selected],
+    queryFn: () => fetchProfile(runId, selected as string),
+    enabled: selected !== null,
+  })
+
+  if (index.isPending) {
+    return (
+      <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+        Loading contracts…
+      </p>
+    )
+  }
+  if (index.isError || !index.data) {
+    return (
+      <p className="text-xs" style={{ color: 'var(--status-critical)' }}>
+        Could not load contract profiles.
+      </p>
+    )
+  }
+
+  const profile = detail.data
+
+  return (
+    <div className="grid gap-4 lg:grid-cols-[minmax(0,260px)_minmax(0,1fr)]">
+      <ul className="flex max-h-[520px] flex-col overflow-y-auto">
+        {index.data.map((row) => (
+          <li key={row.contract_id}>
+            <button
+              type="button"
+              onClick={() => setSelected(row.contract_id)}
+              className="w-full rounded-md px-2 py-1.5 text-left"
+              style={{
+                background:
+                  selected === row.contract_id ? 'var(--surface-1)' : 'transparent',
+              }}
+            >
+              <div className="text-xs font-medium">{row.name}</div>
+              <div className="mono text-[10px]" style={{ color: 'var(--text-muted)' }}>
+                {row.kind} · {row.functions} fns · {row.privileged} guarded
+                {row.cei_candidates > 0 && ` · ${row.cei_candidates} CEI`}
+              </div>
+            </button>
+          </li>
+        ))}
+      </ul>
+
+      {profile === undefined ? (
+        <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+          {selected === null
+            ? 'Pick a contract. Ranked by centrality — the first is where a reader should start.'
+            : 'Loading…'}
+        </p>
+      ) : (
+        <div className="flex min-w-0 flex-col gap-4">
+          <div>
+            <h3 className="text-sm font-semibold">{profile.name}</h3>
+            <p className="mono text-[10px]" style={{ color: 'var(--text-muted)' }}>
+              {profile.path}
+            </p>
+            {profile.purpose && (
+              <p className="mt-2 text-xs" style={{ color: 'var(--text-secondary)' }}>
+                {profile.purpose}
+              </p>
+            )}
+          </div>
+
+          {profile.responsibilities.length > 0 && (
+            <ul className="flex flex-wrap gap-1.5">
+              {profile.responsibilities.map((item) => (
+                <li
+                  key={item}
+                  className="rounded px-1.5 py-0.5 text-[10px]"
+                  style={{ background: 'var(--surface-1)' }}
+                >
+                  {item}
+                </li>
+              ))}
+            </ul>
+          )}
+
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            <Stat label="entry points" value={profile.entrypoints.length} />
+            <Stat label="state" value={profile.state_ids.length} />
+            <Stat label="depends on" value={profile.depends_on.length} />
+            <Stat label="consumed by" value={profile.consumed_by.length} />
+          </div>
+
+          <div>
+            <h4 className="text-xs font-semibold">Functions</h4>
+            <p className="mt-0.5 text-[10px]" style={{ color: 'var(--text-muted)' }}>
+              Open one for its ordered effect sequence.
+            </p>
+            <ul className="mt-1 flex flex-col">
+              {profile.functions.map((fn) => (
+                <BehaviorRow key={fn.id} fn={fn} />
+              ))}
+            </ul>
+          </div>
+
+          {/* Load-bearing. A profile that lists what it knows and stays silent about the
+              rest reads as complete. */}
+          {profile.unknowns.length > 0 && (
+            <div>
+              <h4 className="text-xs font-semibold" style={{ color: 'var(--status-warning)' }}>
+                Not established for this contract
+              </h4>
+              <ul className="mt-1 flex flex-col gap-1 text-[11px]">
+                {profile.unknowns.map((unknown) => (
+                  <li key={unknown} style={{ color: 'var(--text-secondary)' }}>
+                    · {unknown}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+export default function ProtocolPanel({
+  protocol,
+  runId,
+}: {
+  protocol: ProtocolSummary
+  runId: string
+}) {
   const [tab, setTab] = useState<Tab>('overview')
   const { coverage, counts, confidence } = protocol
 
@@ -190,6 +429,7 @@ export default function ProtocolPanel({ protocol }: { protocol: ProtocolSummary 
         {(
           [
             { key: 'overview', label: 'Overview' },
+            { key: 'contracts', label: `Contracts (${protocol.profiles.length})` },
             { key: 'invariants', label: `Invariants (${protocol.invariants.length})` },
             { key: 'risk', label: `Risk surfaces (${protocol.top_risk_surfaces.length})` },
             {
@@ -291,6 +531,7 @@ export default function ProtocolPanel({ protocol }: { protocol: ProtocolSummary 
                         <td className="py-1.5 pr-3 font-medium">{row.name}</td>
                         <td className="py-1.5 pr-3">
                           <span
+                            title={`score ${row.score.toFixed(2)}`}
                             className="mono rounded px-1.5 py-0.5 text-[10px]"
                             style={{
                               background:
@@ -303,6 +544,17 @@ export default function ProtocolPanel({ protocol }: { protocol: ProtocolSummary 
                           >
                             {row.role}
                           </span>
+                          {/* A near-tie is a classification to check, not one to present
+                              as confident. */}
+                          {row.ambiguous && (
+                            <span
+                              title={`also scores as ${row.secondary_roles.join(', ')}`}
+                              className="mono ml-1 text-[10px]"
+                              style={{ color: 'var(--series-2)' }}
+                            >
+                              ?{row.secondary_roles[0]}
+                            </span>
+                          )}
                         </td>
                         <td
                           className="mono py-1.5 text-[10px]"
@@ -319,6 +571,8 @@ export default function ProtocolPanel({ protocol }: { protocol: ProtocolSummary 
           )}
         </div>
       )}
+
+      {tab === 'contracts' && <ContractsTab runId={runId} />}
 
       {tab === 'invariants' && (
         <div className="flex flex-col gap-3">
@@ -354,6 +608,15 @@ export default function ProtocolPanel({ protocol }: { protocol: ProtocolSummary 
                   <span className="text-[10px]" style={{ color: 'var(--text-muted)' }}>
                     {invariant.kind}
                   </span>
+                  {invariant.occurrences > 1 && (
+                    <span
+                      title={`One rule, observed in ${invariant.supporting_contracts.length} contracts`}
+                      className="mono text-[10px]"
+                      style={{ color: 'var(--series-1)' }}
+                    >
+                      holds in {invariant.supporting_contracts.length} contracts
+                    </span>
+                  )}
                 </div>
                 <p className="mt-1.5 text-xs">{invariant.statement}</p>
                 <div
@@ -394,13 +657,14 @@ export default function ProtocolPanel({ protocol }: { protocol: ProtocolSummary 
                   <span className="mono text-[10px]" style={{ color: 'var(--text-muted)' }}>
                     priority {surface.priority.toFixed(2)}
                   </span>
-                  {surface.agents.map((agent) => (
+                  {surface.domains.map((domain) => (
                     <span
-                      key={agent}
+                      key={domain}
+                      title="The kind of reasoning this calls for. Which agent runs is the Orchestrator's decision, not the model's."
                       className="mono text-[10px]"
                       style={{ color: 'var(--text-muted)' }}
                     >
-                      → {agent}
+                      {domain}
                     </span>
                   ))}
                 </div>
@@ -453,7 +717,14 @@ export default function ProtocolPanel({ protocol }: { protocol: ProtocolSummary 
                   >
                     {question.blocking ? '!' : '·'}
                   </span>
-                  <span style={{ color: 'var(--text-secondary)' }}>{question.question}</span>
+                  <span style={{ color: 'var(--text-secondary)' }}>
+                    {question.question}
+                    {question.occurrences > 1 && (
+                      <span className="mono ml-1" style={{ color: 'var(--text-muted)' }}>
+                        (affects {question.affected.length})
+                      </span>
+                    )}
+                  </span>
                 </li>
               ))}
             </ul>

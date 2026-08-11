@@ -202,15 +202,24 @@ _NUMERIC_ONLY = frozenset(
 )
 
 
-def _role_of(variable: StateVar) -> StateRole:
-    """The type constrains what a name is allowed to mean.
+def classify_role(variable: StateVar) -> StateRole:
+    """What this variable means. Shared with the asset stage, so the two cannot disagree.
 
-    `IERC20 public collateralToken` contains "collateral" and is a *handle*, not a
-    collateral record — reading it as one produced a solvency invariant about a token
-    address, which is nonsense that would then be handed to an agent as a candidate.
-    So a numeric role requires a numeric type, and the name only chooses between the roles
-    the type already permits.
+    Two rules, both learned from real output:
+
+    **Mutability beats naming.** A `constant` or `immutable` is a *parameter*, whatever it
+    is called. `MAX_TOTAL_PENALTY` contains "total" and never changes, so it cannot be an
+    accounting total — but it was read as one, and earned a solvency invariant asserting
+    that the protocol's assets must cover a compile-time constant.
+
+    **The type constrains what a name may mean.** `IERC20 public collateralToken` contains
+    "collateral" and is a handle, not a balance; reading it as a collateral record produced
+    a solvency invariant about a token address.
     """
+    # First, and before any name matching: a value that cannot change is not a balance.
+    if variable.is_constant or variable.is_immutable:
+        return StateRole.CONFIG
+
     lowered = variable.name.lower().replace("_", "")
     numeric = _is_numeric(variable.type)
 
@@ -221,13 +230,15 @@ def _role_of(variable: StateVar) -> StateRole:
             continue
         return role
 
-    if variable.is_constant or variable.is_immutable:
-        return StateRole.CONFIG
     if _is_address(variable.type):
         return StateRole.ADDRESS_REF
     if variable.type.startswith("bool"):
         return StateRole.FLAG
     return StateRole.UNKNOWN
+
+
+#: Retained name. `classify_role` is the public one, because `assets.py` needs it too.
+_role_of = classify_role
 
 
 def _is_numeric(type_name: str) -> bool:
@@ -385,4 +396,10 @@ def _first_external_order(index: ProtocolIndex, function_id: str) -> int:
     return min(orders) if orders else -1
 
 
-__all__ = ["CRITICAL_ROLES", "ROLE_BY_NAME", "detect", "transitions"]
+__all__ = [
+    "CRITICAL_ROLES",
+    "ROLE_BY_NAME",
+    "classify_role",
+    "detect",
+    "transitions",
+]

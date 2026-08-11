@@ -24,27 +24,31 @@ from __future__ import annotations
 
 from engine.core.models.evidence import (
     Confidence,
-    Evidence,
     heuristic_evidence,
     source_evidence,
 )
 from engine.core.models.protocol import (
     Accounting,
+    AccountingQuantity,
     Asset,
     AssetKind,
     ContractClassification,
     Dependency,
     DependencyKind,
     EconomicModel,
+    EconomicRelationship,
     EconomicSurface,
     Invariant,
     Operation,
     OperationKind,
+    RelationshipStatus,
     RiskSurface,
+    StateRole,
+    SurfaceDomain,
     SurfaceKind,
 )
 from engine.protocol.heuristics.signatures import ProtocolIndex
-from engine.protocol.ids import make_surface_id
+from engine.protocol.ids import make_relationship_id, make_surface_id
 
 DETECTOR = "economic_model"
 
@@ -187,6 +191,31 @@ BY_DEPENDENCY: dict[DependencyKind, tuple[SurfaceKind, str]] = {
     DependencyKind.BRIDGE: (SurfaceKind.GRIEFING, "delivery depends on an external system"),
 }
 
+#: What kind of *reasoning* each surface calls for — a property of the surface itself, not
+#: of the code around it. Replaces the old `suggested_agents` mapping, which named agents
+#: and derived them from incidental facts: a `centralization` surface picked up the
+#: reentrancy agent because the enclosing function happened to contain an external call,
+#: which is a cross-domain claim with no evidence behind it.
+DOMAINS: dict[SurfaceKind, tuple[SurfaceDomain, ...]] = {
+    SurfaceKind.SHARE_PRICING: (SurfaceDomain.ACCOUNTING, SurfaceDomain.PRICING),
+    SurfaceKind.ROUNDING: (SurfaceDomain.PRECISION, SurfaceDomain.ACCOUNTING),
+    SurfaceKind.PRECISION_LOSS: (SurfaceDomain.PRECISION,),
+    SurfaceKind.FEE: (SurfaceDomain.ACCOUNTING, SurfaceDomain.INCENTIVES),
+    SurfaceKind.DONATION: (SurfaceDomain.ACCOUNTING,),
+    SurfaceKind.FIRST_DEPOSITOR: (SurfaceDomain.ACCOUNTING, SurfaceDomain.PRECISION),
+    SurfaceKind.INFLATION: (SurfaceDomain.ACCOUNTING,),
+    SurfaceKind.SLIPPAGE: (SurfaceDomain.PRICING, SurfaceDomain.ORDERING),
+    SurfaceKind.INTEREST_ACCRUAL: (SurfaceDomain.ACCOUNTING,),
+    SurfaceKind.LIQUIDATION_INCENTIVE: (SurfaceDomain.INCENTIVES, SurfaceDomain.PRICING),
+    SurfaceKind.REWARD_EMISSION: (SurfaceDomain.INCENTIVES, SurfaceDomain.ACCOUNTING),
+    SurfaceKind.ORACLE_PRICING: (SurfaceDomain.PRICING, SurfaceDomain.EXTERNAL_INTERACTION),
+    SurfaceKind.FLASH_LOAN: (SurfaceDomain.EXTERNAL_INTERACTION, SurfaceDomain.ORDERING),
+    SurfaceKind.MEV: (SurfaceDomain.ORDERING,),
+    SurfaceKind.GRIEFING: (SurfaceDomain.LIQUIDITY, SurfaceDomain.EXTERNAL_INTERACTION),
+    SurfaceKind.CENTRALIZATION: (SurfaceDomain.ACCESS_CONTROL,),
+    SurfaceKind.UPGRADE: (SurfaceDomain.UPGRADEABILITY, SurfaceDomain.ACCESS_CONTROL),
+}
+
 MAX_SURFACES_PER_KIND = 8
 
 
@@ -260,8 +289,148 @@ def detect(
         reward_sources=_reward_sources(assets),
         incentives=_incentives(operations),
         value_capture=_value_capture(accounting),
+        relationships=relationships(accounting, operations, classifications),
         surfaces=list(surfaces.values()),
     )
+
+
+#: The pairings an auditor reasons in. Each is (left role, right role, what the coupling is)
+#: — deliberately about *quantities*, not about contracts, because the same pairing spans
+#: several contracts in every non-trivial protocol.
+EXPECTED_PAIRS: tuple[tuple[StateRole, StateRole, str], ...] = (
+    (StateRole.ACCOUNTING_TOTAL, StateRole.SHARE_SUPPLY, "assets per share"),
+    (StateRole.COLLATERAL_RECORD, StateRole.DEBT_RECORD, "debt against collateral"),
+    (StateRole.DEBT_RECORD, StateRole.ACCUMULATOR, "debt against accrued interest"),
+    (StateRole.USER_BALANCE, StateRole.SHARE_SUPPLY, "an account's share of the supply"),
+    (StateRole.ACCOUNTING_TOTAL, StateRole.EXCHANGE_RATE, "the rate the total is valued at"),
+)
+
+
+def relationships(
+    accounting: Accounting,
+    operations: list[Operation],
+    classifications: list[ContractClassification],
+) -> list[EconomicRelationship]:
+    """The `assets ↕ shares`, `collateral ↕ debt` pairings, with their status stated.
+
+    Three statuses, and the third is the one that earns this stage its keep. `FORMULA` means
+    the source combines them and the expression is quoted. `STRUCTURAL` means they move
+    under the same operations — observed coupling, not a proven law. `EXPECTED_MISSING`
+    means the archetype implies a link the code does not show, which is recorded as an open
+    question and **never** as a defect: a vault whose share price is computed off-chain is
+    unusual, not broken, and saying otherwise would be the Protocol Model diagnosing.
+    """
+    by_role: dict[StateRole, list[AccountingQuantity]] = {}
+    role_of: dict[str, StateRole] = {}
+    for quantity in accounting.quantities:
+        role = _role_of(quantity, accounting)
+        role_of[quantity.id] = role
+        by_role.setdefault(role, []).append(quantity)
+
+    # Only relations that *quote* the source count as formulas. The accounting stage also
+    # emits `PROPORTIONAL` relations meaning "these move together", which is an observation
+    # about coupling and not an expression — reporting one as a formula would put a
+    # `DERIVED` label on a structural guess and hand an agent a formula nobody wrote.
+    formulas = {
+        frozenset(relation.quantity_ids): relation
+        for relation in accounting.relations
+        if relation.expression and relation.confidence.rank >= Confidence.DERIVED.rank
+    }
+    movers = {
+        quantity.id: set(quantity.increased_by) | set(quantity.decreased_by)
+        for quantity in accounting.quantities
+    }
+
+    found: dict[str, EconomicRelationship] = {}
+    for left_role, right_role, nature in EXPECTED_PAIRS:
+        lefts = by_role.get(left_role, [])
+        rights = by_role.get(right_role, [])
+        if not lefts or not rights:
+            continue
+
+        for left in lefts:
+            for right in rights:
+                if left.id == right.id:
+                    continue
+                relation = formulas.get(frozenset({left.id, right.id}))
+                shared = movers.get(left.id, set()) & movers.get(right.id, set())
+
+                if relation is not None:
+                    status, formula, evidence = (
+                        RelationshipStatus.FORMULA,
+                        relation.expression,
+                        list(relation.evidence[:2]),
+                    )
+                    confidence = Confidence.DERIVED
+                    question = ""
+                elif shared:
+                    status, formula, confidence, question = (
+                        RelationshipStatus.STRUCTURAL,
+                        "",
+                        Confidence.INFERRED,
+                        "",
+                    )
+                    evidence = [
+                        heuristic_evidence(
+                            DETECTOR,
+                            f"both change under {len(shared)} shared operations",
+                            ref=left.id,
+                        )
+                    ]
+                else:
+                    status, formula, confidence = (
+                        RelationshipStatus.EXPECTED_MISSING,
+                        "",
+                        Confidence.UNKNOWN,
+                    )
+                    question = (
+                        f"How are {left.name} and {right.name} related? A {nature} link is "
+                        "conventional for this shape, and no expression combining them "
+                        "appears in the source this pass could read."
+                    )
+                    evidence = [
+                        heuristic_evidence(
+                            DETECTOR,
+                            f"{left.name} and {right.name} share no operation and no formula",
+                            ref=left.id,
+                        )
+                    ]
+
+                relationship = EconomicRelationship(
+                    id=make_relationship_id(
+                        f"economic:{nature}", sorted([left.id, right.id])
+                    ),
+                    left=left.id,
+                    right=right.id,
+                    nature=nature,
+                    status=status,
+                    formula=formula,
+                    relation_ids=[relation.id] if relation is not None else [],
+                    operation_ids=sorted(shared)[:6],
+                    open_question=question,
+                    confidence=confidence,
+                    evidence=evidence,
+                )
+                found.setdefault(relationship.id, relationship)
+    return list(found.values())
+
+
+def _role_of(quantity: AccountingQuantity, accounting: Accounting) -> StateRole:
+    """The state role behind a quantity, inferred from its unit and name when absent."""
+    lowered = quantity.name.lower()
+    if "share" in lowered or quantity.unit == "shares":
+        return StateRole.SHARE_SUPPLY
+    if "debt" in lowered or "borrow" in lowered:
+        return StateRole.DEBT_RECORD
+    if "collateral" in lowered:
+        return StateRole.COLLATERAL_RECORD
+    if "index" in lowered or "cumulative" in lowered:
+        return StateRole.ACCUMULATOR
+    if "rate" in lowered or "price" in lowered:
+        return StateRole.EXCHANGE_RATE
+    if lowered.startswith("total"):
+        return StateRole.ACCOUNTING_TOTAL
+    return StateRole.USER_BALANCE
 
 
 def _summary(operations: list[Operation], assets: list[Asset]) -> str:
@@ -341,31 +510,40 @@ def risk_surfaces(
         )
         priority = 0.4
         targets = list(economic.function_ids)
-        agents = ["business_logic"]
+        contract_id = ""
+        # Domains come from what the surface *is*, never from what happens to surround it.
+        domains = set(DOMAINS.get(economic.kind, ()))
 
         if operation is not None:
-            classification = by_contract.get(operation.contract_id or "")
+            contract_id = operation.contract_id or ""
+            classification = by_contract.get(contract_id)
             if classification is not None and classification.holds_funds:
                 priority += 0.25
             if operation.is_permissionless:
                 priority += 0.2
             if operation.external_calls:
                 priority += 0.15
-                agents.append("reentrancy")
+                # Evidence-backed: this operation really does hand control outside. That
+                # is a fact about the code, and it is recorded as the domain it is —
+                # "control leaves here" — not as an agent assignment.
+                domains.add(SurfaceDomain.EXTERNAL_INTERACTION)
             if operation.is_privileged:
-                agents.append("access_control")
+                domains.add(SurfaceDomain.ACCESS_CONTROL)
             targets = [operation.function_id]
 
         surfaces[economic.id] = RiskSurface(
             id=economic.id,
             kind=economic.kind,
-            title=economic.description[:120],
+            # Qualified by contract: nine contracts each with an `addAsset` produced nine
+            # surfaces titled identically, which reads as duplication and is not.
+            title=_title(economic.description, contract_id),
             description=" ".join(economic.questions),
             targets=targets,
+            contract_id=contract_id,
             actors=list(economic.actors),
             assets=list(economic.assets),
             priority=round(min(priority, 1.0), 3),
-            suggested_agents=sorted(set(agents)),
+            domains=sorted(domains, key=lambda d: d.value),
             confidence=economic.confidence,
             evidence=list(economic.evidence),
         )
@@ -385,7 +563,10 @@ def risk_surfaces(
                 description=" ".join(dependency.failure_modes),
                 targets=dependency.used_by[:8],
                 priority=0.55,
-                suggested_agents=["business_logic", "oracle"],
+                domains=sorted(
+                    {*DOMAINS.get(kind, ()), SurfaceDomain.EXTERNAL_INTERACTION},
+                    key=lambda d: d.value,
+                ),
                 confidence=Confidence.DERIVED,
                 evidence=list(dependency.evidence[:2]),
             ),
@@ -410,8 +591,9 @@ def risk_surfaces(
                     "contract; check who that is and what delay stands in the way"
                 ),
                 targets=[classification.contract_id],
+                contract_id=classification.contract_id,
                 priority=0.6,
-                suggested_agents=["access_control"],
+                domains=[SurfaceDomain.ACCESS_CONTROL, SurfaceDomain.UPGRADEABILITY],
                 confidence=Confidence.DERIVED,
                 evidence=list(classification.evidence[:2]),
             ),
@@ -437,8 +619,24 @@ def link_invariants(surfaces: list[RiskSurface], invariants: list[Invariant]) ->
         )
 
 
-def _evidence(ref: str, detail: str) -> list[Evidence]:
-    return [heuristic_evidence(DETECTOR, detail, ref=ref)]
+def _title(description: str, contract_id: str) -> str:
+    """Qualify a surface title with its contract.
+
+    Nine contracts each exposing `addAsset` produced nine surfaces all titled "addAsset: a
+    privileged party can change protocol parameters". They are nine genuinely distinct
+    surfaces on nine distinct functions, but an unqualified title makes them read as one
+    record emitted nine times — and the reader who dismisses them as duplicates dismisses
+    eight real ones.
+    """
+    contract = contract_id.rpartition(":")[2]
+    return f"{contract}.{description}"[:160] if contract else description[:160]
 
 
-__all__ = ["BY_DEPENDENCY", "BY_OPERATION", "detect", "link_invariants", "risk_surfaces"]
+__all__ = [
+    "BY_DEPENDENCY",
+    "BY_OPERATION",
+    "DOMAINS",
+    "detect",
+    "link_invariants",
+    "risk_surfaces",
+]

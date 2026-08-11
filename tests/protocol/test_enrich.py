@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 import pytest
 
 from engine.core.models.evidence import Confidence, EvidenceKind
-from engine.core.models.protocol import ContractRole, StateRole
+from engine.core.models.protocol import ContractRole
 from engine.protocol.enrich import NullProvider, enrich
 from engine.protocol.enrich.context import build as build_context
 from engine.protocol.enrich.provider import Completion, Message
@@ -111,7 +111,8 @@ def test_fenced_json_is_accepted(built):
 def test_an_answer_citing_code_it_was_never_shown_is_rejected(built):
     """The gate that catches confabulation: a model cannot cite a function it never saw."""
     model, code = built
-    gap = next(g for g in model.gaps if g.field == "assets.is_fee_on_transfer")
+    # Raises if the gap this test is about stopped being produced.
+    assert any(g.field == "assets.is_fee_on_transfer" for g in model.gaps)
     provider = FakeProvider(
         responses=[answer("yes", ["src/Invented.sol:Ghost.rug()"])] * 10
     )

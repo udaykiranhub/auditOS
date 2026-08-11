@@ -37,12 +37,34 @@ Every reference to code is a `SolidityID` (§7.2); every reference within this a
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 from engine.core.models.evidence import Claim, Confidence, Evidence, EvidenceKind
 
-SCHEMA_VERSION = "1.0.0"
+# 1.1: semantic-quality refinement.
+#   + Confidence.UNKNOWN — an absence is no longer indistinguishable from an observation
+#   + ContractClassification.roles — a contract may hold several roles, each with its own
+#     score and evidence; `role`/`secondary_roles` become views over it
+#   + Asset.role / .identity / .aliases — *what it is for* separated from *what it is* and
+#     from *whether we know it is the same thing as that other one*
+#   + Invariant.semantic_key / .supporting_* — one invariant, many supporting locations
+#   + RiskSurface.domains replaces .suggested_agents — the model describes the surface;
+#     the Orchestrator picks agents from its own registry (migration note in README)
+#   + EconomicModel.relationships — paired quantities, with missing links as open questions
+#   + SemanticGap.affected / .occurrences — one canonical question, many sightings
+#
+# 1.2: contract-level semantic IR. The global model answered "what is this protocol"; it did
+# not answer "what is this contract, and what does this function do", which is the only
+# question an agent ever actually has. Purely additive — every 1.1 field is unchanged.
+#   + ProtocolModel.profiles — one ContractProfile per in-scope contract, indexing the
+#     global lists and carrying the per-contract detail that has nowhere else to live
+#   + FunctionBehavior / FunctionStep — ordered CHECK→READ→CALCULATE→WRITE→EXTERNAL_CALL
+#     effect sequences, which is what makes CEI, ordering and accounting reasoning possible
+#   + Permission — *how* a function is gated, not merely whether it is
+#   + ContractRelationship — the cross-contract graph as first-class records
+SCHEMA_VERSION = "1.2.0"
 
 ARTIFACT_NAME = "protocol"
 
@@ -145,10 +167,22 @@ class ContractRole(StrEnum):
     GOVERNANCE = "governance"
     TIMELOCK = "timelock"
     ACCESS_CONTROL = "access_control"
+    GUARDIAN = "guardian"
     BRIDGE = "bridge"
     MESSENGER = "messenger"
     FACTORY = "factory"
     REGISTRY = "registry"
+    PRICING_MODULE = "pricing_module"
+    """Values or accounts for an asset without custodying it — Arcadia's asset modules,
+    Euler's price adapters, Compound's `CToken` valuation path. Distinct from `ORACLE`
+    (which *sources* a price) and from `VAULT` (which *holds* the funds); conflating the
+    three is how a valuation adapter ends up carrying solvency invariants about funds it
+    never touches."""
+    ACCOUNT = "account"
+    """A per-user smart account or position container. Common enough across account
+    abstraction, isolated-margin and NFT-position designs to be its own role."""
+    HOOK = "hook"
+    MIGRATOR = "migrator"
     PROXY = "proxy"
     IMPLEMENTATION = "implementation"
     ESCROW = "escrow"
@@ -159,6 +193,26 @@ class ContractRole(StrEnum):
     MOCK = "mock"
     TEST_HELPER = "test_helper"
     UNKNOWN = "unknown"
+
+
+class RoleAssignment(Claim):
+    """One role a contract holds, with the score and evidence behind *that* role.
+
+    A contract genuinely has several: a lending pool that issues its own share token is a
+    lending market and a token, and dropping the second loses the share-accounting half of
+    every finding about it. Scoring each separately — rather than picking one and listing
+    the rest as bare enum values — is what lets a reader see that "vault" scored 0.81 and
+    "registry" scored 0.79, which is exactly the case where the classification is a
+    coin-flip and should be treated as one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    role: ContractRole
+    score: float = 0.0
+    """0..1, normalized by the strength of the rule that matched. Comparable *between*
+    roles on one contract; not calibrated as a probability."""
+    rationale: str = ""
 
 
 class ContractClassification(Claim):
@@ -173,8 +227,9 @@ class ContractClassification(Claim):
     id: str  # ProtocolID: role:<contract_id>
     contract_id: str
     name: str = ""
-    role: ContractRole = ContractRole.UNKNOWN
-    secondary_roles: list[ContractRole] = Field(default_factory=list)
+    roles: list[RoleAssignment] = Field(default_factory=list)
+    """Every role that cleared the bar, strongest first. The source of truth; `role` and
+    `secondary_roles` below are views over it, kept because existing consumers read them."""
     component_id: str | None = None
     purpose: str = ""
 
@@ -186,6 +241,50 @@ class ContractClassification(Claim):
     """Can custody value: receives ETH, or is the `to` of a `transferFrom`."""
     centrality: float = 0.0
     """PageRank over the call graph. Drives `core_contracts` and context ranking (SPEC §7.6)."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_computed(cls, data: Any) -> Any:
+        """Ignore the computed views on the way in.
+
+        They are serialized so the JSON contract survives, and `extra="forbid"` would
+        otherwise reject the artifact this model itself just wrote — a round trip that
+        fails is worse than the compatibility it was added for. Genuine typos are still
+        rejected, because only these three names are dropped.
+        """
+        if isinstance(data, dict):
+            return {
+                key: value
+                for key, value in data.items()
+                if key not in ("role", "secondary_roles", "is_ambiguous")
+            }
+        return data
+
+    # `computed_field`, not a bare property: these were real fields before schema 1.1 and
+    # they still have to appear in `protocol.json`, or every consumer reading the artifact
+    # as JSON breaks silently. `roles` is the source of truth; these are views that
+    # serialize.
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def role(self) -> ContractRole:
+        """The strongest role, or `UNKNOWN` when nothing cleared the bar."""
+        return self.roles[0].role if self.roles else ContractRole.UNKNOWN
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def secondary_roles(self) -> list[ContractRole]:
+        return [assignment.role for assignment in self.roles[1:]]
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def is_ambiguous(self) -> bool:
+        """True when the top two roles are within a whisker of each other.
+
+        Worth surfacing rather than hiding: a near-tie is a classification the reader
+        should check, and presenting it as a confident single role is how a valuation
+        module gets audited as a vault.
+        """
+        return len(self.roles) > 1 and (self.roles[0].score - self.roles[1].score) < 0.15
 
 
 # ══ 3. Standard detection ══════════════════════════════════════════════════════
@@ -389,6 +488,48 @@ class AssetKind(StrEnum):
     UNKNOWN = "unknown"
 
 
+class AssetRole(StrEnum):
+    """What an asset is *for*, which is not what it *is*.
+
+    `AssetKind` says "this is an ERC-20"; `AssetRole` says "this is the collateral". The
+    same token is collateral in one contract and the underlying in another, so the two
+    axes have to be separate — collapsing them means a protocol's debt token and its
+    reward token become indistinguishable the moment both are ERC-20s.
+    """
+
+    UNDERLYING = "underlying"
+    COLLATERAL = "collateral"
+    DEBT = "debt"
+    SHARE = "share"
+    REWARD = "reward"
+    FEE = "fee"
+    WRAPPED = "wrapped"
+    TRACKED = "tracked"
+    """Accounted for but never custodied — a registry's price entry, a valuation module's
+    exposure record. It is a number about someone else's asset, not an asset held here."""
+    UNKNOWN = "unknown"
+
+
+class AssetIdentity(StrEnum):
+    """Whether we actually know *which* token this is.
+
+    The distinction the refinement pass exists to preserve. Two contracts each declaring
+    `IERC20 public asset` may hold the same token or two different ones; the source cannot
+    say, because the address arrives at construction. Merging them asserts an identity
+    nobody established; splitting them silently asserts a difference nobody established
+    either. So the uncertainty is recorded, and an open question is raised once per group.
+    """
+
+    RESOLVED_CONTRACT = "resolved_contract"
+    """Backed by a token contract that is in this repository. Same contract, same asset."""
+
+    RESOLVED_CONSTANT = "resolved_constant"
+    """Bound to a constant or immutable address literal in the source."""
+
+    UNRESOLVED = "unresolved"
+    """A handle whose value is set at runtime. Identity is genuinely unknown."""
+
+
 class Asset(Claim):
     """Something of value the protocol moves or accounts for.
 
@@ -404,6 +545,20 @@ class Asset(Claim):
     symbol: str = ""
     name: str = ""
     kind: AssetKind = AssetKind.UNKNOWN
+    role: AssetRole = AssetRole.UNKNOWN
+
+    identity: AssetIdentity = AssetIdentity.UNRESOLVED
+    identity_group: str = ""
+    """Assets that *may* be the same thing, grouped by declared type and role. Members of a
+    group are not merged — that would assert an identity nobody established — but the group
+    is what one open question is raised about, instead of one per sighting."""
+
+    aliases: list[str] = Field(default_factory=list)
+    """Every variable name this asset is known by, across every contract that holds it.
+    Two names for one asset must not become two assets, and this is where that is recorded."""
+
+    declared_type: str = ""
+    """The Solidity type of the handle: `IERC20`, `ERC20`, `address`. Part of identity."""
 
     contract_id: str | None = None
     """The token contract, when it lives in this repository."""
@@ -544,6 +699,12 @@ class Operation(Claim):
     external_calls: list[str] = Field(default_factory=list)
     """Where control leaves. Carried on the operation because "does this operation hand
     control to an untrusted party?" is asked by three different agents."""
+
+    related_operations: list[str] = Field(default_factory=list)
+    """Operations that must be reasoned about together with this one — the inverse
+    (`deposit` ↔ `withdraw`), and others sharing its critical state. A retrieval that
+    returns `withdraw` without `deposit` hands an agent half an accounting system and asks
+    it to find the imbalance."""
 
     emits: list[str] = Field(default_factory=list)
     is_payable: bool = False
@@ -773,6 +934,29 @@ class SurfaceKind(StrEnum):
     UPGRADE = "upgrade"
 
 
+class SurfaceDomain(StrEnum):
+    """What *kind of reasoning* a surface calls for — deliberately not which agent runs.
+
+    The Orchestrator selects agents from its own registry, matching agent capabilities
+    against these domains. Naming agents here would hardcode today's roster into an
+    artifact that outlives it, and would let the Protocol Model answer "which agent must
+    run?", which is a decision it has no basis for and that the acceptance criteria
+    explicitly place downstream.
+    """
+
+    ACCOUNTING = "accounting"
+    ACCESS_CONTROL = "access_control"
+    EXTERNAL_INTERACTION = "external_interaction"
+    """Control or value crosses to code this repository does not contain."""
+    PRICING = "pricing"
+    PRECISION = "precision"
+    UPGRADEABILITY = "upgradeability"
+    INCENTIVES = "incentives"
+    LIQUIDITY = "liquidity"
+    ORDERING = "ordering"
+    """Outcome depends on transaction or call ordering — MEV, front-running, CEI."""
+
+
 class EconomicSurface(Claim):
     """Where value is created, destroyed, redistributed, or lost to arithmetic.
 
@@ -798,6 +982,45 @@ class EconomicSurface(Claim):
     survives being wrong; an assertion does not."""
 
 
+class RelationshipStatus(StrEnum):
+    """How well established a paired relationship is."""
+
+    FORMULA = "formula"
+    """The source contains an expression combining the two. Quoted, not paraphrased."""
+    STRUCTURAL = "structural"
+    """The two move under the same operations. Observed coupling, not a proven law."""
+    EXPECTED_MISSING = "expected_missing"
+    """The archetype implies a link and the code shows none. Recorded as an open question,
+    never as a defect — a vault whose share price is computed off-chain is unusual, not
+    broken, and asserting otherwise would be the Protocol Model diagnosing."""
+
+
+class EconomicRelationship(Claim):
+    """A pairing between two economic quantities: `assets ↕ shares`, `collateral ↕ debt`.
+
+    Coarser than `AccountingRelation` (which is a specific expression) and the level an
+    auditor actually reasons at. Kept descriptive: `nature` says *how* they are coupled,
+    never whether the coupling is exploitable.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str  # ProtocolID: rel:<digest>
+    left: str
+    """`ProtocolID` of a quantity or asset."""
+    right: str
+    nature: str = ""
+    """`assets per share`, `debt against collateral`, `fee taken from yield`."""
+    status: RelationshipStatus = RelationshipStatus.STRUCTURAL
+    formula: str = ""
+    """Verbatim from the source when `status` is `FORMULA`; empty otherwise. Never inferred
+    text dressed as a quotation."""
+    relation_ids: list[str] = Field(default_factory=list)
+    operation_ids: list[str] = Field(default_factory=list)
+    open_question: str = ""
+    """Set when `status` is `EXPECTED_MISSING`, so the gap travels with the relationship."""
+
+
 class EconomicModel(BaseModel):
     """Stage 13: how value enters, moves and leaves."""
 
@@ -809,6 +1032,7 @@ class EconomicModel(BaseModel):
     incentives: list[str] = Field(default_factory=list)
     """Behaviours the protocol pays for: liquidation bounties, keeper rewards, LP yield."""
     value_capture: list[str] = Field(default_factory=list)
+    relationships: list[EconomicRelationship] = Field(default_factory=list)
     surfaces: list[EconomicSurface] = Field(default_factory=list)
 
 
@@ -914,9 +1138,27 @@ class Invariant(Claim):
     kind: InvariantKind = InvariantKind.ACCOUNTING
     status: InvariantStatus = InvariantStatus.CANDIDATE
 
+    semantic_key: str = ""
+    """What makes two invariants *the same rule*. Derived from the structure — the kind,
+    the roles of the quantities involved, the normalized shape of the expression — never
+    from the wording. Two sentences that read alike are not the same invariant, and two
+    that read differently may well be.
+
+    One rule holding across four contracts is one invariant with four supporting
+    locations, not four invariants. The Arcadia lending run produced three separate
+    solvency invariants that were the same rule applied to three totals, and an agent
+    handed those spends its budget three times on one question."""
+
     targets: list[str] = Field(default_factory=list)
-    """`SolidityID`s the invariant constrains. Required — an invariant with no target
-    cannot be checked, cannot be cited, and must not be emitted."""
+    """Every `SolidityID` this invariant constrains, across all supporting locations.
+    Required — an invariant with no target cannot be checked, cited, or turned into a test."""
+
+    supporting_contracts: list[str] = Field(default_factory=list)
+    """The contracts this rule was observed in. Populated by merging; length > 1 means the
+    same rule holds in several places, which is information, not duplication."""
+    supporting_variables: list[str] = Field(default_factory=list)
+    occurrences: int = 1
+    """How many independent sightings were merged into this record."""
 
     quantity_ids: list[str] = Field(default_factory=list)
     operation_ids: list[str] = Field(default_factory=list)
@@ -978,11 +1220,20 @@ class RiskSurface(Claim):
     title: str = ""
     description: str = ""
     targets: list[str] = Field(default_factory=list)  # SolidityIDs
+    contract_id: str = ""
     actors: list[str] = Field(default_factory=list)
     assets: list[str] = Field(default_factory=list)
     invariant_ids: list[str] = Field(default_factory=list)
     priority: float = 0.0  # 0..1
-    suggested_agents: list[str] = Field(default_factory=list)
+
+    domains: list[SurfaceDomain] = Field(default_factory=list)
+    """What kind of reasoning this calls for. **Replaces `suggested_agents` (schema 1.1).**
+
+    The old field named agents directly, which put an agent-selection decision inside an
+    artifact that has no basis for making one — and produced mappings with no evidence
+    behind them, such as a `centralization` surface routed to the reentrancy agent because
+    the enclosing function happened to contain an external call. Domains are descriptive:
+    the Orchestrator matches them against its agent registry's declared capabilities."""
 
 
 class SemanticGap(BaseModel):
@@ -1009,9 +1260,21 @@ class SemanticGap(BaseModel):
     """The minimal set of `SolidityID`s an answer needs. Keeping this small is the entire
     cost-control mechanism for Phase H."""
 
+    affected: list[str] = Field(default_factory=list)
+    """Every entity this one question bears on. The Arcadia run asked "does the token
+    behind REWARD_TOKEN charge a fee on transfer?" four times — once per staking module —
+    which is one question with four affected assets, and paying for it four times is the
+    enrichment budget going to waste on a question already answered."""
+    occurrences: int = 1
+
     priority: float = 0.0
     blocking: bool = False
     """True when a downstream stage produces something misleading without an answer."""
+
+    resolution_confidence: Confidence = Confidence.UNKNOWN
+    """How sure we are that this is *genuinely* unresolved rather than merely undetected.
+    `UNKNOWN` is the honest default; `DERIVED` means a rule established that the fact is
+    unavailable from source (an external token's transfer behaviour, for instance)."""
 
 
 class Enrichment(BaseModel):
@@ -1029,6 +1292,327 @@ class Enrichment(BaseModel):
     """Answers that failed evidence validation. A rising number here is the signal that
     the enrichment prompt or the gap framing is wrong."""
     notes: list[str] = Field(default_factory=list)
+
+
+# ══ 16. Contract profiles ══════════════════════════════════════════════════════
+#
+# Everything above this line describes the protocol *globally*: its actors, its assets, its
+# invariants. That is the right shape for "what is this system", and the wrong shape for the
+# question an agent actually asks, which is always **about one contract**.
+#
+# A global model answers "the protocol has 98 operations and 10 risk surfaces". An agent
+# investigating `LendingPool.borrow` needs: what this contract is for, what state it owns,
+# what `borrow` reads and writes *in what order*, where control leaves, who may call it,
+# which invariants constrain it, and what is still unknown. Assembling that from six global
+# lists is a join every agent would have to perform, identically, at inference cost — and
+# would get subtly wrong in six different ways.
+#
+# So the profile is **an index, not a copy**. Everything here either (a) points into the
+# global lists by `ProtocolID`, or (b) is genuinely per-contract detail that has nowhere
+# else to live — the ordered effect sequence of a function body, the permission mechanism
+# guarding it. Nothing is duplicated, so nothing can drift.
+
+
+class EffectKind(StrEnum):
+    """One step in a function body, typed by what it does to the world.
+
+    ```
+    CHECK → READ → CALCULATE → WRITE → EXTERNAL_CALL → …
+    ```
+
+    The *order* is the point. Reentrancy is a WRITE after an EXTERNAL_CALL; a stale-price
+    bug is a READ before a CHECK that never happens; a CEI violation is visible in the
+    sequence and invisible in any unordered summary of the same facts. `CodeModel` records
+    an `order` on every call and state access precisely so this projection is possible
+    without inventing a control-flow graph (SPEC §12.2 rules that out).
+    """
+
+    CHECK = "check"
+    """`require` / `assert` / `revert`, or a modifier — the modifiers run first, by language
+    semantics, so they are recorded at a negative order rather than guessed into place."""
+
+    READ = "read"
+    CALCULATE = "calculate"
+    """A pure builtin: `keccak256`, `abi.encode`, a math helper. Not value-bearing on its
+    own, but its position separates "computed then checked" from "checked then computed"."""
+
+    WRITE = "write"
+    INTERNAL_CALL = "internal_call"
+    """Stays in this frame's trust domain: same contract, an ancestor, or a library."""
+
+    EXTERNAL_CALL = "external_call"
+    """Control leaves. Every reentrancy and untrusted-callback question starts here."""
+
+    TRANSFER = "transfer"
+    """An external call the Graph Engine typed as a token movement."""
+
+    CREATE = "create"
+
+
+class FunctionStep(BaseModel):
+    """One ordered effect. Not a `Claim`: this is read straight off `CodeModel`, quoting the
+    source, and asserts nothing beyond "this token appears at this position"."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    order: int
+    kind: EffectKind
+    detail: str = ""
+    """As written in the source — the call expression, the variable name, the guard."""
+    target: str = ""
+    """`SolidityID` of the callee or state variable when resolved; a graph sentinel
+    (`@UNTRUSTED_EXTERNAL`) when the call leaves the repository; empty when neither."""
+    line: int = 0
+
+
+class FunctionBehavior(Claim):
+    """What one function *does*, at the level an agent reasons at.
+
+    ```
+    borrow(uint256)                                            actor: borrower
+    ├── checks    require(!paused), modifier nonReentrant
+    ├── reads     totalLiquidity, debtOf
+    ├── writes    debtOf, totalBorrows
+    ├── calls out asset.transfer(msg.sender, amount)      ← control leaves here
+    └── writes after that call: none
+    ```
+
+    Distinct from `Operation`, which is the *protocol-level* meaning of an entrypoint
+    (`DEPOSIT`, actor `USER`, in ASSET out SHARES) and exists only for entrypoints on
+    classified contracts. This is the *body-level* description, and it also covers the
+    internal functions that entrypoints delegate their real work to — where, in practice,
+    the accounting lives.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str  # ProtocolID: fn:<function_id>
+    function_id: str
+    contract_id: str
+    name: str = ""
+    signature: str = ""
+    visibility: str = ""
+    mutability: str = ""
+    operation_id: str | None = None
+    """The protocol-level `Operation`, when this function is a classified entrypoint."""
+
+    purpose: str = ""
+    documented_purpose: str = ""
+    """The function's NatSpec `@notice`/`@dev` lede, verbatim. A *claim by the authors*,
+    kept separate from `purpose` so that a doc/code disagreement stays visible instead of
+    being averaged into one sentence."""
+
+    inputs: list[str] = Field(default_factory=list)
+    """`uint256 amount` — declared parameters, as written."""
+    outputs: list[str] = Field(default_factory=list)
+
+    modifiers: list[str] = Field(default_factory=list)
+    caller_requirements: list[str] = Field(default_factory=list)
+    """What stands between an arbitrary caller and this body: the privileged modifiers."""
+    preconditions: list[str] = Field(default_factory=list)
+
+    reads: list[str] = Field(default_factory=list)  # state ProtocolIDs
+    writes: list[str] = Field(default_factory=list)
+    internal_calls: list[str] = Field(default_factory=list)  # SolidityIDs
+    external_calls: list[str] = Field(default_factory=list)
+    """Call expressions as written, or the sentinel they resolved to."""
+    token_movements: list[str] = Field(default_factory=list)
+    """`transfers asset → recipient`, derived from the Graph Engine's signature-typed edges."""
+
+    emits: list[str] = Field(default_factory=list)
+    reverts: list[str] = Field(default_factory=list)
+
+    steps: list[FunctionStep] = Field(default_factory=list)
+    steps_truncated: int = 0
+    """How many steps were dropped past the cap. Non-zero means the sequence is a prefix,
+    which a reader must know before concluding "nothing happens after the external call"."""
+
+    writes_after_external_call: list[str] = Field(default_factory=list)
+    """State written at a position after control first left the frame. A **candidate**, not
+    a finding: a reentrancy guard may cover it, and deciding that is the agent's job."""
+
+    is_entrypoint: bool = False
+    is_view: bool = False
+    is_payable: bool = False
+    is_privileged: bool = False
+    has_assembly: bool = False
+    has_loop: bool = False
+    has_unchecked: bool = False
+
+    @property
+    def hands_over_control(self) -> bool:
+        hands_over = (EffectKind.EXTERNAL_CALL, EffectKind.TRANSFER)
+        return any(step.kind in hands_over for step in self.steps)
+
+
+class PermissionMechanism(StrEnum):
+    """*How* a function is gated, not merely whether it is.
+
+    "Privileged" collapses a governance-timelocked upgrade and a `require(msg.sender ==
+    factory)` into one bit, and those two are a centralization note and a composability
+    constraint respectively. The mechanism is what decides which.
+    """
+
+    OPEN = "open"
+    """Any address may call it. Not a defect — most protocols need this — but it is the
+    precondition for every permissionless attack path."""
+
+    OWNER = "owner"
+    ROLE = "role"  # OpenZeppelin AccessControl and friends
+    GOVERNANCE = "governance"  # governor or timelock
+    GUARDIAN = "guardian"
+    CONTRACT_ONLY = "contract_only"
+    """Callable only by a named peer contract — a factory, a registry, a paired pool."""
+    SELF_ONLY = "self_only"
+    SIGNATURE = "signature"  # EIP-712 / EIP-1271 authorization instead of msg.sender
+    UNKNOWN_GUARD = "unknown_guard"
+    """A modifier is applied whose meaning this pass could not establish. Explicitly *not*
+    `OPEN`: a guard we failed to recognise must never be reported as no guard at all."""
+
+
+class Permission(Claim):
+    """Who may invoke one function, through what mechanism, and what it lets them change."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str  # ProtocolID: perm:<function_id>
+    function_id: str
+    contract_id: str
+    name: str = ""
+    mechanism: PermissionMechanism = PermissionMechanism.OPEN
+    actor_ids: list[str] = Field(default_factory=list)
+    modifiers: list[str] = Field(default_factory=list)
+    checks: list[str] = Field(default_factory=list)
+    """In-body authorization checks, verbatim: `require(msg.sender == factory)`."""
+    affected_state: list[str] = Field(default_factory=list)  # state ProtocolIDs
+    is_privileged: bool = False
+
+
+class ContractRelationKind(StrEnum):
+    """How one contract depends on another. Directed; the direction is the security content."""
+
+    INHERITS = "inherits"
+    IMPLEMENTS = "implements"
+    USES_LIBRARY = "uses_library"
+    CALLS = "calls"
+    CREATES = "creates"
+    DELEGATES_TO = "delegates_to"
+    """`delegatecall` — the callee executes in *this* contract's storage. Categorically
+    different from `CALLS` and the reason it is not folded into it."""
+    READS_STATE_FROM = "reads_state_from"
+    """Calls a view on the other contract: this contract's behaviour depends on state it
+    does not own and cannot constrain."""
+    TRANSFERS_ASSET_TO = "transfers_asset_to"
+    DEPENDS_ON_EXTERNAL = "depends_on_external"
+    """Reaches a `Dependency` — an interface whose implementation is not in this repository."""
+    CALLBACK_INTO = "callback_into"
+    """The other side calls back into this contract. The reentrancy precondition, stated as
+    a relationship rather than left to be re-derived per agent."""
+
+
+class ContractRelationship(Claim):
+    """One directed edge between two contracts, with the call sites that produced it.
+
+    Rolled up from `GraphModel` edges rather than restated: a relationship with no call site
+    behind it would be an assertion about architecture, and this artifact does not make
+    those.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str  # ProtocolID: crel:<digest>
+    source: str
+    """`SolidityID` of the contract the edge leaves."""
+    target: str
+    """`SolidityID` of a contract, a `ProtocolID` of a `Dependency`, or a graph sentinel."""
+    target_name: str = ""
+    kind: ContractRelationKind = ContractRelationKind.CALLS
+    detail: str = ""
+    call_sites: list[str] = Field(default_factory=list)  # SolidityIDs of calling functions
+    occurrences: int = 1
+
+
+class ContractProfile(Claim):
+    """One contract, described end to end — the unit an agent is actually pointed at.
+
+    **An index over the global model, plus the detail that has nowhere else to live.**
+    `operation_ids`, `state_ids`, `invariant_ids` and the rest are `ProtocolID`s into the
+    lists above; `functions` and `permissions` are per-contract records that exist here
+    because they are per-contract facts. Nothing is copied, so a profile cannot disagree
+    with the model it indexes.
+
+    `unknowns` is not an afterthought. A profile that lists nine things it knows and stays
+    silent about the tenth reads as complete; the same profile that says "the semantic role
+    of `interestWeight` could not be established" tells a downstream agent exactly where its
+    own reasoning has to start.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str  # ProtocolID: profile:<contract_id>
+    contract_id: str
+    name: str = ""
+    path: str = ""
+    kind: str = "contract"  # contract | abstract | library | interface
+    classification_id: str = ""  # role:<contract_id>
+    component_id: str | None = None
+
+    inherits: list[str] = Field(default_factory=list)
+    implements: list[str] = Field(default_factory=list)
+    """Standards this contract satisfies, as `Standard` values — the compliance detail is on
+    `standard_ids`, so a reader sees the claim and can reach its receipts."""
+    libraries: list[str] = Field(default_factory=list)
+
+    purpose: str = ""
+    """What this contract appears to be responsible for, assembled from its role, its state
+    roles and its operation kinds. Deterministic and templated; `INFERRED`, and the evidence
+    names what it was assembled from."""
+    documented_purpose: str = ""
+    responsibilities: list[str] = Field(default_factory=list)
+    centrality: float = 0.0
+
+    functions: list[FunctionBehavior] = Field(default_factory=list)
+    permissions: list[Permission] = Field(default_factory=list)
+
+    # ── Index into the global model ───────────────────────────────────────────
+    entrypoints: list[str] = Field(default_factory=list)  # SolidityIDs
+    operation_ids: list[str] = Field(default_factory=list)
+    state_ids: list[str] = Field(default_factory=list)
+    actor_ids: list[str] = Field(default_factory=list)
+    asset_ids: list[str] = Field(default_factory=list)
+    dependency_ids: list[str] = Field(default_factory=list)
+    flow_ids: list[str] = Field(default_factory=list)
+    quantity_ids: list[str] = Field(default_factory=list)
+    relationship_ids: list[str] = Field(default_factory=list)  # economic pairings
+    invariant_ids: list[str] = Field(default_factory=list)
+    surface_ids: list[str] = Field(default_factory=list)
+    boundary_ids: list[str] = Field(default_factory=list)
+    standard_ids: list[str] = Field(default_factory=list)
+    gap_ids: list[str] = Field(default_factory=list)
+
+    # ── Cross-contract position ───────────────────────────────────────────────
+    depends_on: list[str] = Field(default_factory=list)
+    """Contracts and dependencies this one reaches out to."""
+    consumed_by: list[str] = Field(default_factory=list)
+    """Contracts that call into this one. "Who breaks if I change this?"."""
+    edge_ids: list[str] = Field(default_factory=list)  # ContractRelationship ProtocolIDs
+
+    unknowns: list[str] = Field(default_factory=list)
+    """Named blind spots for *this* contract, in plain language. Never inferred away."""
+
+    @property
+    def privileged_functions(self) -> list[str]:
+        return sorted({p.function_id for p in self.permissions if p.is_privileged})
+
+    @property
+    def external_call_functions(self) -> list[str]:
+        return sorted({f.function_id for f in self.functions if f.external_calls})
+
+    @property
+    def cei_candidates(self) -> list[str]:
+        """Functions writing state after control left the frame. Where to look, not what is
+        wrong — the guard that makes it safe may well be there."""
+        return sorted({f.function_id for f in self.functions if f.writes_after_external_call})
 
 
 # ══ 17. Assembly ═══════════════════════════════════════════════════════════════
@@ -1052,6 +1636,17 @@ class Coverage(BaseModel):
     state_vars_explained: int = 0
     grounded_claims: int = 0
     ungrounded_claims: int = 0
+
+    contracts_profiled: int = 0
+    """Contracts with a `ContractProfile`. The denominator is `contracts_total`."""
+    functions_described: int = 0
+    """Function bodies with an ordered effect sequence — the depth an agent can rely on
+    without re-reading the repository, which is the whole point of the profile layer."""
+    functions_total: int = 0
+    purposes_stated: int = 0
+    """Profiles whose purpose could actually be assembled. A low number here is honest
+    output, not a bug: it means role and state inference found little to say."""
+
     unmodelled: list[str] = Field(default_factory=list)
     """Named blind spots: assembly bodies, proxies whose implementation is absent,
     dependencies with no interface. Silence here would read as completeness."""
@@ -1059,6 +1654,14 @@ class Coverage(BaseModel):
     @property
     def classification_rate(self) -> float:
         return self.contracts_classified / self.contracts_total if self.contracts_total else 0.0
+
+    @property
+    def profile_rate(self) -> float:
+        return self.contracts_profiled / self.contracts_total if self.contracts_total else 0.0
+
+    @property
+    def description_rate(self) -> float:
+        return self.functions_described / self.functions_total if self.functions_total else 0.0
 
     @property
     def operation_rate(self) -> float:
@@ -1124,6 +1727,13 @@ class ProtocolModel(BaseModel):
     invariants: list[Invariant] = Field(default_factory=list)
     risk_surfaces: list[RiskSurface] = Field(default_factory=list)
 
+    # 16 — the contract-level view (schema 1.2)
+    profiles: list[ContractProfile] = Field(default_factory=list)
+    """One per in-scope contract. An index over everything above, plus per-function
+    behaviour. This is what a Context Builder slices on; the lists above are what it
+    resolves the slice against."""
+    contract_relationships: list[ContractRelationship] = Field(default_factory=list)
+
     # 16–17 — honesty about the result
     core_contracts: list[str] = Field(default_factory=list)
     """Ranked most-central first. Drives context selection (SPEC §7.6)."""
@@ -1188,6 +1798,66 @@ class ProtocolModel(BaseModel):
     def operations_of_kind(self, kind: OperationKind) -> list[Operation]:
         return [o for o in self.operations if o.kind is kind]
 
+    def operations_of(self, contract_id: str) -> list[Operation]:
+        return [o for o in self.operations if o.contract_id == contract_id]
+
+    def state_of(self, contract_id: str) -> list[StateItem]:
+        return [s for s in self.state if s.contract_id == contract_id]
+
+    def invariants_touching(self, *solidity_ids: str) -> list[Invariant]:
+        """Every invariant constraining any of these `SolidityID`s — the join a retrieval
+        needs to answer "what should be true about this function?"."""
+        wanted = set(solidity_ids)
+        return [i for i in self.invariants if wanted & set(i.targets)]
+
+    def surfaces_touching(self, *solidity_ids: str) -> list[RiskSurface]:
+        wanted = set(solidity_ids)
+        return [s for s in self.risk_surfaces if wanted & set(s.targets)]
+
+    def gaps_touching(self, *ids: str) -> list[SemanticGap]:
+        wanted = set(ids)
+        return [
+            g
+            for g in self.gaps
+            if wanted & ({g.subject, *g.affected, *g.context_ids})
+        ]
+
+    # ── Contract-level lookups (schema 1.2) ───────────────────────────────────
+
+    def profile(self, contract_id: str) -> ContractProfile | None:
+        return next((p for p in self.profiles if p.contract_id == contract_id), None)
+
+    def profile_by_name(self, name: str) -> ContractProfile | None:
+        return next((p for p in self.profiles if p.name == name), None)
+
+    def behavior(self, function_id: str) -> FunctionBehavior | None:
+        """The body-level description of one function, wherever it lives.
+
+        Scanning profiles rather than keeping a second flat list: one home for a record
+        means it cannot fall out of sync with itself, and the profile is the home.
+        """
+        for candidate in self.profiles:
+            for behavior in candidate.functions:
+                if behavior.function_id == function_id:
+                    return behavior
+        return None
+
+    def behaviors(self) -> list[FunctionBehavior]:
+        return [behavior for p in self.profiles for behavior in p.functions]
+
+    def permission_for(self, function_id: str) -> Permission | None:
+        for candidate in self.profiles:
+            for permission in candidate.permissions:
+                if permission.function_id == function_id:
+                    return permission
+        return None
+
+    def relationships_from(self, contract_id: str) -> list[ContractRelationship]:
+        return [r for r in self.contract_relationships if r.source == contract_id]
+
+    def relationships_to(self, contract_id: str) -> list[ContractRelationship]:
+        return [r for r in self.contract_relationships if r.target == contract_id]
+
     def standards_of(self, contract_id: str) -> list[StandardClaim]:
         return [s for s in self.standards if s.contract_id == contract_id]
 
@@ -1207,6 +1877,11 @@ class ProtocolModel(BaseModel):
         nested: list[Claim] = []
         for actor in self.actors:
             nested.extend(actor.capabilities)
+        for classification in self.contracts:
+            nested.extend(classification.roles)
+        for candidate in self.profiles:
+            nested.extend(candidate.functions)
+            nested.extend(candidate.permissions)
         return [
             *self.archetypes,
             *self.components,
@@ -1223,11 +1898,14 @@ class ProtocolModel(BaseModel):
             *self.dependencies,
             *self.accounting.quantities,
             *self.accounting.relations,
+            *self.economics.relationships,
             *self.economics.surfaces,
             *self.documentation_rules,
             *self.assumptions,
             *self.invariants,
             *self.risk_surfaces,
+            *self.profiles,
+            *self.contract_relationships,
         ]
 
     def evidence_for(self, protocol_id: str) -> list[Evidence]:
@@ -1287,6 +1965,10 @@ class ProtocolModel(BaseModel):
             "assumptions": len(self.assumptions),
             "invariants": len(self.invariants),
             "risk_surfaces": len(self.risk_surfaces),
+            "profiles": len(self.profiles),
+            "function_behaviors": sum(len(p.functions) for p in self.profiles),
+            "permissions": sum(len(p.permissions) for p in self.profiles),
+            "contract_relationships": len(self.contract_relationships),
             "gaps": len(self.gaps),
         }
 
@@ -1317,17 +1999,18 @@ class ProtocolModel(BaseModel):
 
 __all__ = [
     "ARTIFACT_NAME",
-    "SCHEMA_VERSION",
     "Accounting",
     "AccountingQuantity",
     "AccountingRelation",
-    "ActorKind",
     "Actor",
+    "ActorKind",
     "Archetype",
     "ArchetypeClaim",
     "Asset",
     "AssetFlow",
+    "AssetIdentity",
     "AssetKind",
+    "AssetRole",
     "Assumption",
     "Capability",
     "Claim",
@@ -1335,33 +2018,46 @@ __all__ = [
     "Component",
     "Confidence",
     "ContractClassification",
+    "ContractProfile",
+    "ContractRelationKind",
+    "ContractRelationship",
     "ContractRole",
     "Coverage",
     "Dependency",
     "DependencyKind",
     "DocumentationRule",
     "EconomicModel",
+    "EconomicRelationship",
     "EconomicSurface",
+    "EffectKind",
     "Enrichment",
     "Evidence",
     "EvidenceKind",
     "FlowKind",
+    "FunctionBehavior",
+    "FunctionStep",
     "Invariant",
     "InvariantKind",
     "InvariantStatus",
     "Operation",
     "OperationKind",
+    "Permission",
+    "PermissionMechanism",
     "ProtocolIdentity",
     "ProtocolModel",
     "Reconciliation",
     "RelationKind",
+    "RelationshipStatus",
     "RiskSurface",
+    "RoleAssignment",
+    "SCHEMA_VERSION",
     "SemanticGap",
     "Standard",
     "StandardClaim",
     "StateItem",
     "StateRole",
     "StateTransition",
+    "SurfaceDomain",
     "SurfaceKind",
     "TransitionEffect",
     "TrustBoundary",

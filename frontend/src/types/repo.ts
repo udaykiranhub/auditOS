@@ -403,6 +403,7 @@ export interface GraphModel {
 
 /** How a claim was arrived at. Ordered weakest-first; `derived` and above are grounded. */
 export type ClaimConfidence =
+  | 'unknown'
   | 'refuted'
   | 'proposed'
   | 'inferred'
@@ -436,6 +437,10 @@ export interface ContractRoleRow {
   contract_id: string
   name: string
   role: string
+  secondary_roles: string[]
+  score: number
+  /** The top two roles are within a whisker of each other — worth checking, not hiding. */
+  ambiguous: boolean
 }
 
 export interface RiskSurfaceRow {
@@ -444,7 +449,11 @@ export interface RiskSurfaceRow {
   title: string
   priority: number
   targets: string[]
-  agents: string[]
+  /**
+   * What kind of reasoning this calls for — replaces the old `agents` field (schema 1.1).
+   * The model describes the surface; the Orchestrator picks agents from its own registry.
+   */
+  domains: string[]
 }
 
 export interface DocConflictRow {
@@ -460,12 +469,18 @@ export interface InvariantRow {
   /** Starts at `candidate`; only an executed Forge run can reach `verified`. */
   status: 'candidate' | 'supported' | 'verified' | 'refuted' | 'unverifiable'
   targets: string[]
+  /** Where this one rule was observed. More than one is coverage, not duplication. */
+  supporting_contracts: string[]
+  occurrences: number
 }
 
 export interface OpenQuestionRow {
   id: string
   question: string
   blocking: boolean
+  /** Every entity one answer would resolve. Asked once, applied to all. */
+  affected: string[]
+  occurrences: number
 }
 
 export interface EnrichmentRow {
@@ -476,6 +491,151 @@ export interface EnrichmentRow {
   gaps_answered: number
   gaps_rejected: number
   notes: string[]
+}
+
+/** One ordered effect in a function body. The order is what reentrancy questions read. */
+export interface FunctionStep {
+  order: number
+  kind:
+    | 'check'
+    | 'read'
+    | 'calculate'
+    | 'write'
+    | 'internal_call'
+    | 'external_call'
+    | 'transfer'
+    | 'create'
+  detail: string
+  target: string
+  line: number
+}
+
+export interface FunctionBehavior {
+  id: string
+  function_id: string
+  contract_id: string
+  name: string
+  signature: string
+  visibility: string
+  mutability: string
+  operation_id: string | null
+  purpose: string
+  documented_purpose: string
+  inputs: string[]
+  outputs: string[]
+  modifiers: string[]
+  /** The modifiers that actually gate an arbitrary caller — body-checked, not name-matched. */
+  caller_requirements: string[]
+  preconditions: string[]
+  reads: string[]
+  writes: string[]
+  internal_calls: string[]
+  external_calls: string[]
+  token_movements: string[]
+  emits: string[]
+  reverts: string[]
+  steps: FunctionStep[]
+  /** Non-zero means `steps` is a prefix — read before concluding "nothing happens after". */
+  steps_truncated: number
+  writes_after_external_call: string[]
+  is_entrypoint: boolean
+  is_view: boolean
+  is_payable: boolean
+  is_privileged: boolean
+  has_assembly: boolean
+  has_loop: boolean
+  has_unchecked: boolean
+}
+
+export interface Permission {
+  id: string
+  function_id: string
+  contract_id: string
+  name: string
+  mechanism:
+    | 'open'
+    | 'owner'
+    | 'role'
+    | 'governance'
+    | 'guardian'
+    | 'contract_only'
+    | 'self_only'
+    | 'signature'
+    | 'unknown_guard'
+  actor_ids: string[]
+  modifiers: string[]
+  checks: string[]
+  affected_state: string[]
+  is_privileged: boolean
+}
+
+/**
+ * One contract, described end to end.
+ *
+ * Everything with a `ProtocolID` here is an index into the full `ProtocolModel`; only
+ * `functions` and `permissions` are records that live on the profile itself.
+ */
+export interface ContractProfile {
+  id: string
+  contract_id: string
+  name: string
+  path: string
+  kind: string
+  classification_id: string
+  component_id: string | null
+  inherits: string[]
+  implements: string[]
+  libraries: string[]
+  purpose: string
+  documented_purpose: string
+  responsibilities: string[]
+  centrality: number
+  functions: FunctionBehavior[]
+  permissions: Permission[]
+  entrypoints: string[]
+  operation_ids: string[]
+  state_ids: string[]
+  actor_ids: string[]
+  asset_ids: string[]
+  dependency_ids: string[]
+  flow_ids: string[]
+  quantity_ids: string[]
+  relationship_ids: string[]
+  invariant_ids: string[]
+  surface_ids: string[]
+  boundary_ids: string[]
+  standard_ids: string[]
+  gap_ids: string[]
+  depends_on: string[]
+  consumed_by: string[]
+  edge_ids: string[]
+  /** Named blind spots for this contract. Never inferred away. */
+  unknowns: string[]
+  confidence: ClaimConfidence
+}
+
+/** One contract as it appears in the summary — named only, so the payload stays small. */
+export interface ProfileRow {
+  contract_id: string
+  name: string
+  purpose: string
+  functions: number
+  unknowns: number
+}
+
+/** A row of `GET /protocol/profiles` — the index a reader picks from. */
+export interface ProfileIndexRow extends ProfileRow {
+  id: string
+  path: string
+  kind: string
+  centrality: number
+  responsibilities: string[]
+  implements: string[]
+  entrypoints: number
+  privileged: number
+  /** Functions writing state after control left the frame. Where to look, not a finding. */
+  cei_candidates: number
+  state: number
 }
 
 export interface ProtocolSummary {
@@ -492,6 +652,8 @@ export interface ProtocolSummary {
   documentation_conflicts: DocConflictRow[]
   invariants: InvariantRow[]
   open_questions: OpenQuestionRow[]
+  /** The contract-level view (schema 1.2), ranked by centrality. */
+  profiles: ProfileRow[]
   enrichment: EnrichmentRow
   notes: string[]
 }

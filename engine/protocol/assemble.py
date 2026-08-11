@@ -128,6 +128,17 @@ def measure(model: ProtocolModel, code: CodeModel | None = None) -> Coverage:
     claims = model.claims()
     grounded = sum(1 for claim in claims if claim.is_grounded)
 
+    described = sum(len(profile.functions) for profile in model.profiles)
+    # The denominator is every implemented function on a profiled contract — not every
+    # function in the repository. A profile deliberately skips pure formatting helpers, and
+    # counting those against it would understate the depth on a protocol that has plenty.
+    describable = sum(
+        len([f for f in contract.functions if f.is_implemented])
+        + len(contract.modifiers)
+        for profile in model.profiles
+        if (contract := _contract_of(code, profile.contract_id)) is not None
+    )
+
     return Coverage(
         contracts_total=contracts_total,
         contracts_classified=classified,
@@ -137,8 +148,18 @@ def measure(model: ProtocolModel, code: CodeModel | None = None) -> Coverage:
         state_vars_explained=explained,
         grounded_claims=grounded,
         ungrounded_claims=len(claims) - grounded,
+        contracts_profiled=len(model.profiles),
+        functions_described=described,
+        functions_total=describable or described,
+        purposes_stated=sum(1 for profile in model.profiles if profile.purpose),
         unmodelled=sorted(set(model.coverage.unmodelled)),
     )
+
+
+def _contract_of(code: CodeModel | None, contract_id: str):
+    if code is None:
+        return None
+    return next((c for c in code.contracts if c.id == contract_id), None)
 
 
 def _dedupe_notes(notes: list[str]) -> list[str]:

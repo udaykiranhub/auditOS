@@ -51,6 +51,11 @@ NAMESPACES = frozenset(
         "assume",
         "inv",
         "gap",
+        # 16 — the contract-level view
+        "profile",
+        "fn",
+        "perm",
+        "crel",
     }
 )
 
@@ -236,6 +241,39 @@ def invariant_label(ordinal: int) -> str:
     return f"INV-{ordinal:03d}"
 
 
+# ── 16. Contract profiles ─────────────────────────────────────────────────────
+
+
+def make_profile_id(contract_id: str) -> str:
+    """`profile:src/Vault.sol:Vault` — one profile per contract, so the contract is the key.
+
+    Readable rather than digested, and deliberately parallel to `role:` on the same
+    contract: a reader looking at `role:src/Vault.sol:Vault` can guess the profile's ID
+    without consulting an index, which is most of what an ID scheme is for.
+    """
+    return f"profile:{contract_id}"
+
+
+def make_behavior_id(function_id: str) -> str:
+    """`fn:src/Vault.sol:Vault.deposit(uint256)` — keyed on the function, so overloads stay
+    distinct and the record joins straight back to the body it describes."""
+    return f"fn:{function_id}"
+
+
+def make_permission_id(function_id: str) -> str:
+    """`perm:src/Vault.sol:Vault.setFee(uint256)` — one permission record per function."""
+    return f"perm:{function_id}"
+
+
+def make_contract_relation_id(source: str, target: str, kind: str) -> str:
+    """`crel:2b9f04e17a6d` — digest, because the natural key is a directed triple.
+
+    Direction participates in the key and is never normalized: `Pool calls Oracle` and
+    `Oracle calls Pool` are different facts, and the second one is a callback.
+    """
+    return f"crel:{digest(kind, source, target)}"
+
+
 # ── 16–17. Enrichment targets ─────────────────────────────────────────────────
 
 
@@ -256,14 +294,18 @@ __all__ = [
     "make_actor_id",
     "make_assumption_id",
     "make_asset_id",
+    "make_behavior_id",
     "make_boundary_id",
     "make_component_id",
+    "make_contract_relation_id",
     "make_dependency_id",
     "make_doc_rule_id",
     "make_flow_id",
     "make_gap_id",
     "make_invariant_id",
     "make_operation_id",
+    "make_permission_id",
+    "make_profile_id",
     "make_protocol_id",
     "make_quantity_id",
     "make_relationship_id",

@@ -39,6 +39,7 @@ from engine.core.models.protocol import (
     OperationKind,
     ProtocolModel,
     Reconciliation,
+    RoleAssignment,
     SemanticGap,
     StateRole,
 )
@@ -235,7 +236,17 @@ def _apply(model: ProtocolModel, gap: SemanticGap, answer: _Answer) -> bool:
         target = model.contract(gap.subject.removeprefix("role:"))
         if target is None or target.role is not ContractRole.UNKNOWN:
             return False  # never overwrite a deterministic classification
-        target.role = ContractRole(answer.value)
+        # `role` is a view over `roles`; a proposal is a role *assignment* like any other,
+        # carrying its own score and evidence rather than being written past them.
+        target.roles = [
+            RoleAssignment(
+                role=ContractRole(answer.value),
+                score=0.5,
+                rationale="proposed by an enrichment pass; no deterministic rule matched",
+                confidence=Confidence.PROPOSED,
+                evidence=evidence,
+            )
+        ]
         target.purpose = answer.text
         return _record(target, evidence)
 

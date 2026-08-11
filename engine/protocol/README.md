@@ -44,6 +44,10 @@ python -m engine protocol <path> --enrich --verify  # optional layers
 | `heuristics/docs.py` | what the docs claim, and whether code agrees | 14 |
 | `heuristics/invariants.py` | candidate invariants and their assumptions | 15 |
 | `heuristics/gaps.py` | the questions this pass could not answer | 16 |
+| `heuristics/behavior.py` | one function body as an ordered effect sequence | 16 |
+| `heuristics/relationships.py` | directed contract → contract edges, with call sites | 16 |
+| `heuristics/profiles.py` | one profile per contract — the unit an agent is pointed at | 16 |
+| `query.py` | `ProtocolQuery` — retrieve a connected slice around one anchor | — |
 | `enrich/` | **optional**: gap → small context → LLM → validated claim | H |
 | `verify/` | **optional**: candidate invariant → Forge run → PASS/FAIL | I |
 
@@ -203,6 +207,59 @@ Nothing here requires that every contract has a role, every variable a meaning, 
 invariants were found at all. `Coverage` reports what was actually managed, with
 denominators from `CodeModel`: "we classified 4 contracts" means nothing without "out of
 47", and `unmodelled` names the blind spots because silence reads as completeness.
+
+## Schema 1.1 — semantic-quality refinement
+
+Driven by running 1.0 against Arcadia Finance and reading the output: the role classifier
+put 21 of 35 contracts in the "vault" bucket, assets included exposure ledgers and
+configuration parameters, one rule was emitted once per contract that satisfied it, and
+risk surfaces named agents on evidence that did not support the claim. Full before/after
+numbers, per-change rationale and the 1.0 → 1.1 migration table are in
+[REFINEMENT.md](REFINEMENT.md).
+
+The one interface change to know about: **`RiskSurface.suggested_agents` is gone**, replaced
+by `domains`. Agent selection belongs to the Orchestrator and its registry, not to an
+artifact that has no basis for making it.
+
+## Schema 1.2 — the contract-level view
+
+1.1 described the protocol. It did not describe the *contracts*, and a downstream agent
+handed `LendingPool · 98 operations · 10 flows · 10 risks` still has to read the repository
+to do anything with it. 1.2 adds stage 16's three passes, and with them the chain
+`contract → function → state → flow → relationship` that a Context Builder can slice on:
+
+```
+ContractProfile          one per in-scope contract
+├── purpose              assembled from role + state roles + operation kinds, never authored
+├── functions            FunctionBehavior — an ordered CHECK → READ → WRITE → EXTERNAL_CALL
+├── permissions          Permission — who may call it, through what mechanism
+├── <thing>_ids          indexes into the global lists, never copies
+├── depends_on/consumed_by   who this breaks, and who breaks it
+└── unknowns             what could not be established, named specifically
+ContractRelationship     directed A → B edges, each with the call sites behind it
+```
+
+**Why the sequence, and not a set.** Reentrancy is a WRITE after an EXTERNAL_CALL; a CEI
+violation is visible in the order and invisible in any unordered summary of the same facts.
+`FunctionBehavior.writes_after_external_call` is a *candidate* — a guard may cover it, and
+deciding that is the agent's job, not this artifact's.
+
+**A profile is an index, not a copy.** Everything with a `ProtocolID` points into the lists
+above it, so a profile cannot drift from the model it describes. Only `functions` and
+`permissions` live on the profile, because they are per-contract facts with nowhere else to
+go.
+
+Additive over 1.1: `ProtocolModel.profiles` and `.contract_relationships` are new fields,
+`Coverage` gained four counters, and nothing was removed or renamed. A 1.1 artifact loads
+under 1.2 with both lists empty, and `coverage.contracts_profiled` reads `0` rather than
+implying a completeness that pass never had.
+
+Full rationale, the three semantic defects real output exposed, before/after numbers and the
+1.1 → 1.2 migration table are in [PROFILES.md](PROFILES.md).
+
+New endpoints: `GET /protocol/profiles` (one line per contract) and
+`GET /protocol/profiles/{contract}` (one contract in full, addressed by `SolidityID` or by
+name). The summary carries profile names only — the bodies are most of the artifact.
 
 ## Canonical ordering is not cosmetic
 

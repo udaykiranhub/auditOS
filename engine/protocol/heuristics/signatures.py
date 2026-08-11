@@ -16,6 +16,7 @@ that asks "does this contract have X" gets the flattened answer.
 
 from __future__ import annotations
 
+import re
 from functools import cached_property
 
 from engine.core.models.code import (
@@ -27,7 +28,7 @@ from engine.core.models.code import (
     Param,
     StateVar,
 )
-from engine.core.models.graph import EdgeKind, GraphModel
+from engine.core.models.graph import Edge, EdgeKind, GraphModel
 from engine.graphs.query import GraphQuery
 
 #: Modifier names that conventionally gate an admin-only path. Name-based, so this only ever
@@ -58,6 +59,72 @@ PRIVILEGED_MODIFIERS = (
 
 #: Names whose presence in a contract or file name means "not the protocol".
 NON_PROTOCOL_HINTS = ("mock", "test", "harness", "stub", "fake", "echidna", "invariant")
+
+
+def camel_tokens(name: str) -> list[str]:
+    """`batchProcessDeposit` → `["batch", "process", "deposit"]`.
+
+    Solidity names are camelCase by universal convention, so the word boundaries are
+    recoverable — and recovering them is what separates a real signal from a coincidence.
+    Naive substring matching reads `getUsdValueExposureToUnderlyingAssetAfterDeposit` as a
+    deposit function; on Arcadia that made every valuation module score as a vault, which
+    then propagated into its assets, its invariants and its risk surfaces.
+    """
+    return [token for token in _TOKEN_SPLIT.findall(name) if token]
+
+
+def has_token(name: str, needle: str) -> bool:
+    """Does `name` contain `needle` as a whole word (or run of words)?
+
+    `has_token("batchProcessDeposit", "deposit")` is True; `has_token("assetModule",
+    "asset")` is True; `has_token("assetToAssetInformation", "asset")` is True — all
+    correct, because `asset` really is a word there. What it rejects is `has_token("index",
+    "de")` and, crucially, the accidental matches inside longer words.
+    """
+    tokens = _folded(name)
+    needle_tokens = _folded(needle)
+    if not needle_tokens:
+        return False
+    span = len(needle_tokens)
+    return any(
+        tokens[i : i + span] == needle_tokens for i in range(len(tokens) - span + 1)
+    )
+
+
+def starts_with_token(name: str, needle: str) -> bool:
+    """Whole-word prefix. `withdrawAll` starts with `withdraw`; `withdrawnAt` does not.
+
+    Prefix position carries meaning that mere presence does not: a function *named for*
+    an action performs it, while one that merely mentions it usually reports on it —
+    `getUsdValueAfterDeposit` is a view about deposits, not a deposit.
+    """
+    tokens = _folded(name)
+    needle_tokens = _folded(needle)
+    return bool(needle_tokens) and tokens[: len(needle_tokens)] == needle_tokens
+
+
+def _folded(name: str) -> list[str]:
+    """Tokens, case-folded for comparison.
+
+    `camel_tokens` preserves case because it is a tokenizer and the original spelling is
+    what a reader recognizes. Matching folds, because `Deposit` and `deposit` are the same
+    word and only the boundary between words carries meaning here.
+    """
+    return [token.lower() for token in camel_tokens(name)]
+
+
+_TOKEN_SPLIT = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
+
+#: Edge kinds whose target is a callee. `MODIFIED_BY` is excluded: a modifier is applied to
+#: a function, not called from a position in its body, so it has no order to join on.
+_CALL_EDGE_KINDS = frozenset(
+    {
+        EdgeKind.CALLS,
+        EdgeKind.DELEGATECALLS,
+        EdgeKind.STATICCALLS,
+        EdgeKind.CREATES,
+    }
+)
 
 
 def signature_of(function: Function) -> str:
@@ -237,16 +304,61 @@ class ProtocolIndex:
         return bool(self.guards(function))
 
     def guards(self, function: Function) -> list[str]:
-        return sorted(
-            {
-                modifier
-                for modifier in function.modifiers
-                if _normalize(modifier).startswith(PRIVILEGED_MODIFIERS)
-            }
-        )
+        return privileged_names(function.modifiers)
 
     def is_view(self, function: Function) -> bool:
         return function.mutability in ("view", "pure")
+
+    @cached_property
+    def modifier_table(self) -> dict[str, dict[str, Function]]:
+        """contract_id → modifier name → its definition, inheritance flattened.
+
+        Flattened because `onlyOwner` is almost never declared on the contract that uses it,
+        and a table that only knows about locally-declared modifiers finds nothing on any
+        OpenZeppelin-based protocol.
+
+        Lives here rather than in a stage because two stages need the same answer: the
+        behaviour pass, to decide whether a modifier actually gates a caller, and the
+        permission pass, to read the check out of its body. Two copies of this table are two
+        chances for one artifact to describe the same modifier in contradictory ways.
+        """
+        table: dict[str, dict[str, Function]] = {}
+        for contract in self.code.contracts:
+            found: dict[str, Function] = {}
+            for ancestor_id in reversed(self.query.inheritance(contract.id)):
+                ancestor = self.contracts.get(ancestor_id)
+                if ancestor is not None:
+                    found.update({m.name: m for m in ancestor.modifiers})
+            table[contract.id] = found
+        return table
+
+    @cached_property
+    def libraries_by_name(self) -> dict[str, Contract]:
+        """Every in-repo `library`, by bare name. Receivers of `SafeCastLib.toUint128(x)`."""
+        return {
+            contract.name: contract
+            for contract in self.code.contracts
+            if contract.kind is ContractKind.LIBRARY
+        }
+
+    def bound_library_members(self, contract_id: str) -> frozenset[str]:
+        """Function names reachable through `using L for T` on this contract or an ancestor.
+
+        `amount.mulDivUp(x, y)` is syntactically indistinguishable from an external call on
+        an address, and typing it as one puts a phantom trust-boundary crossing in the middle
+        of every accounting function in the repository. The `using` directive is the evidence
+        that the receiver is a value and the callee is in-frame.
+        """
+        members: set[str] = set()
+        for ancestor_id in self.query.inheritance(contract_id):
+            ancestor = self.contracts.get(ancestor_id)
+            if ancestor is None:
+                continue
+            for directive in ancestor.using_for:
+                library = self.libraries_by_name.get(directive.library)
+                if library is not None:
+                    members.update(f.name for f in library.functions)
+        return frozenset(members)
 
     # ── Graph shortcuts ───────────────────────────────────────────────────────
 
@@ -263,6 +375,52 @@ class ProtocolIndex:
                 (edge.kind, edge.via or edge.target, edge.text, edge.line)
             )
         return flows
+
+    @cached_property
+    def call_targets_by_order(self) -> dict[str, dict[int, str]]:
+        """function_id → {call order → resolved target}.
+
+        `order` is the one field a `CallSite` and its `Edge` are guaranteed to share, so it
+        is how the parser's ordered body and the graph's resolved targets are joined. Built
+        once for the whole repository: doing it per function turns the behaviour stage
+        quadratic on anything with a few thousand call sites.
+        """
+        joined: dict[str, dict[int, str]] = {}
+        for edge in self.graph.edges:
+            if edge.kind in _CALL_EDGE_KINDS and edge.order >= 0:
+                joined.setdefault(edge.source, {}).setdefault(edge.order, edge.target)
+        return joined
+
+    @cached_property
+    def call_edges_by_contract(self) -> dict[str, list[Edge]]:
+        """declaring contract_id → every outgoing call edge from its functions.
+
+        The rollup the cross-contract relationship stage needs. Grouped once because the
+        alternative — scanning `graph.edges` per contract — is quadratic, and a real
+        protocol has six figures of edges.
+        """
+        grouped: dict[str, list[Edge]] = {}
+        for edge in self.graph.edges:
+            if edge.kind not in _CALL_EDGE_KINDS:
+                continue
+            function = self.functions.get(edge.source)
+            if function is None or function.contract_id is None:
+                continue
+            grouped.setdefault(function.contract_id, []).append(edge)
+        for edges in grouped.values():
+            edges.sort(key=lambda edge: edge.key())
+        return grouped
+
+    @cached_property
+    def token_targets_by_order(self) -> dict[str, dict[int, str]]:
+        """function_id → {call order → the token or receiver a movement went through}."""
+        joined: dict[str, dict[int, str]] = {}
+        for edge in self.query.token_flows():
+            if edge.order >= 0:
+                joined.setdefault(edge.source, {}).setdefault(
+                    edge.order, edge.via or edge.target
+                )
+        return joined
 
     @cached_property
     def contract_rank(self) -> dict[str, float]:
@@ -330,10 +488,24 @@ def _normalize(name: str) -> str:
     return name.lower().replace("_", "")
 
 
+def privileged_names(modifiers: list[str]) -> list[str]:
+    """Those of `modifiers` whose *name* matches the conventional admin vocabulary.
+
+    Name-based, so `INFERRED` at best, and blind to protocol-specific guards like
+    `onlyTranche`. Callers that can read modifier bodies should do so as well — see
+    `behaviour._guards`.
+    """
+    return sorted({m for m in modifiers if _normalize(m).startswith(PRIVILEGED_MODIFIERS)})
+
+
 __all__ = [
     "NON_PROTOCOL_HINTS",
     "PRIVILEGED_MODIFIERS",
     "ProtocolIndex",
+    "camel_tokens",
+    "has_token",
+    "privileged_names",
     "return_signature",
     "signature_of",
+    "starts_with_token",
 ]

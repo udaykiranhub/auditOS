@@ -20,6 +20,8 @@ GET  /audits/{run_id}/graph/query   the SPEC §13.5 queries, one call each
 POST /audits/{run_id}/protocol      CodeModel + GraphModel -> ProtocolModel
 GET  /audits/{run_id}/protocol      the persisted ProtocolModel
 GET  /audits/{run_id}/protocol/summary   the overview, without the megabytes
+GET  /audits/{run_id}/protocol/profiles  one line per contract
+GET  /audits/{run_id}/protocol/profiles/{contract}  one contract, in full
 ```
 """
 
@@ -569,7 +571,16 @@ def protocol_summary(run_id: str) -> dict[str, Any]:
         "evidence": model.evidence_histogram(),
         "core_contracts": model.core_contracts[:10],
         "roles": [
-            {"contract_id": c.contract_id, "name": c.name, "role": c.role.value}
+            {
+                "contract_id": c.contract_id,
+                "name": c.name,
+                "role": c.role.value,
+                "secondary_roles": [r.value for r in c.secondary_roles],
+                "score": c.roles[0].score if c.roles else 0.0,
+                # A near-tie is a classification the reader should check, not one to
+                # present as confident.
+                "ambiguous": c.is_ambiguous,
+            }
             for c in sorted(model.contracts, key=lambda c: -c.centrality)[:20]
         ],
         "top_risk_surfaces": [
@@ -579,9 +590,21 @@ def protocol_summary(run_id: str) -> dict[str, Any]:
                 "title": s.title,
                 "priority": s.priority,
                 "targets": s.targets[:4],
-                "agents": s.suggested_agents,
+                "domains": [d.value for d in s.domains],
             }
             for s in sorted(model.risk_surfaces, key=lambda s: -s.priority)[:10]
+        ],
+        # The contract-level view, named only. A UI lists these and fetches the one the
+        # reader clicks; inlining them here would put the whole artifact in the summary.
+        "profiles": [
+            {
+                "contract_id": p.contract_id,
+                "name": p.name,
+                "purpose": p.purpose,
+                "functions": len(p.functions),
+                "unknowns": len(p.unknowns),
+            }
+            for p in sorted(model.profiles, key=lambda p: -p.centrality)[:20]
         ],
         "documentation_conflicts": [
             {"statement": r.statement, "finding": r.finding, "subjects": r.subject_ids}
@@ -594,16 +617,79 @@ def protocol_summary(run_id: str) -> dict[str, Any]:
                 "kind": i.kind.value,
                 "status": i.status.value,
                 "targets": i.targets[:4],
+                "supporting_contracts": i.supporting_contracts,
+                "occurrences": i.occurrences,
             }
             for i in model.invariants
         ],
         "open_questions": [
-            {"id": g.id, "question": g.question, "blocking": g.blocking}
+            {
+                "id": g.id,
+                "question": g.question,
+                "blocking": g.blocking,
+                "affected": g.affected,
+                "occurrences": g.occurrences,
+            }
             for g in sorted(model.gaps, key=lambda g: (not g.blocking, -g.priority))[:15]
         ],
         "enrichment": model.enrichment.model_dump(mode="json"),
         "notes": model.notes,
     }
+
+
+@app.get("/audits/{run_id}/protocol/profiles")
+def protocol_profiles(run_id: str) -> dict[str, Any]:
+    """One line per contract: enough to render a list, not enough to be megabytes.
+
+    A profile carries every function body it described, so the full set for a real
+    repository is most of the artifact. This is the index; `/profiles/{contract}` is the
+    detail.
+    """
+    model = get_protocol(run_id)
+    return {
+        "profiles": [
+            {
+                "id": p.id,
+                "contract_id": p.contract_id,
+                "name": p.name,
+                "path": p.path,
+                "kind": p.kind,
+                "purpose": p.purpose,
+                "centrality": p.centrality,
+                "responsibilities": p.responsibilities,
+                "implements": p.implements,
+                "entrypoints": len(p.entrypoints),
+                "functions": len(p.functions),
+                "privileged": len(p.privileged_functions),
+                "cei_candidates": len(p.cei_candidates),
+                "state": len(p.state_ids),
+                "unknowns": len(p.unknowns),
+            }
+            for p in sorted(model.profiles, key=lambda p: -p.centrality)
+        ]
+    }
+
+
+@app.get("/audits/{run_id}/protocol/profiles/{contract:path}")
+def protocol_profile(run_id: str, contract: str) -> dict[str, Any]:
+    """One contract in full, addressed by `SolidityID` or by bare name.
+
+    Both spellings resolve because both are what a caller has: a UI holds the `SolidityID`
+    it was given, and a human holds "LendingPool". `:path` because a `SolidityID` is
+    `src/Vault.sol:Vault` — it contains the separator, and a plain parameter would match
+    only the last segment of it.
+    """
+    model = get_protocol(run_id)
+    found = model.profile(contract) or model.profile_by_name(contract)
+    if found is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": f"Run {run_id} has no profile for {contract!r}.",
+                "hint": f"GET /audits/{run_id}/protocol/profiles lists the available ones.",
+            },
+        )
+    return found.model_dump(mode="json")
 
 
 @app.get("/audits/{run_id}/build", response_model=BuildModel)

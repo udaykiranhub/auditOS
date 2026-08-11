@@ -285,7 +285,9 @@ export default function App() {
           {tab === 'build' && build.data && <BuildPanel build={build.data} />}
           {tab === 'parse' && parse.data && <ParsePanel code={parse.data} />}
           {tab === 'graph' && graph.data && <GraphPanel graph={graph.data} />}
-          {tab === 'protocol' && protocol.data && <ProtocolPanel protocol={protocol.data} />}
+          {tab === 'protocol' && protocol.data && (
+            <ProtocolPanel protocol={protocol.data} runId={runId} />
+          )}
         </>
       )}
 

@@ -34,6 +34,30 @@ def _capability_key(capability: Capability) -> tuple[str, str]:
     return (capability.function_id, capability.description)
 
 
+#: Cross-reference lists on a `ContractProfile`. Every one is a set of IDs with no inherent
+#: order, so every one sorts. `responsibilities` and `unknowns` are prose in a chosen order
+#: and are deliberately absent from this list.
+_PROFILE_ID_LISTS = (
+    "entrypoints",
+    "operation_ids",
+    "state_ids",
+    "actor_ids",
+    "asset_ids",
+    "dependency_ids",
+    "flow_ids",
+    "quantity_ids",
+    "relationship_ids",
+    "invariant_ids",
+    "surface_ids",
+    "boundary_ids",
+    "standard_ids",
+    "gap_ids",
+    "depends_on",
+    "consumed_by",
+    "edge_ids",
+)
+
+
 def canonicalize(model: ProtocolModel) -> ProtocolModel:
     """Return an equivalent model in canonical order, with evidence deduped.
 
@@ -67,15 +91,51 @@ def canonicalize(model: ProtocolModel) -> ProtocolModel:
             "reward_sources": sorted(set(model.economics.reward_sources)),
             "incentives": sorted(set(model.economics.incentives)),
             "value_capture": sorted(set(model.economics.value_capture)),
+            "relationships": sorted(model.economics.relationships, key=lambda r: r.id),
             "surfaces": sorted(model.economics.surfaces, key=lambda s: s.id),
         }
     )
 
+    # A classification's role list is a *ranking* — strongest first — so it is ordered by
+    # score, not by name. Sorting it alphabetically would destroy the only thing it says.
+    contracts = [
+        classification.model_copy(
+            update={
+                "roles": sorted(
+                    classification.roles, key=lambda a: (-a.score, a.role.value)
+                )
+            }
+        )
+        for classification in model.contracts
+    ]
+
+    # A profile's own lists are already ID-sorted at construction; re-sorting here is what
+    # makes that a guarantee rather than a convention, and `steps` is deliberately *not*
+    # touched — its order is the execution sequence and sorting it would destroy the only
+    # thing it says.
+    profiles = [
+        profile.model_copy(
+            update={
+                "functions": sorted(profile.functions, key=lambda f: f.id),
+                "permissions": sorted(profile.permissions, key=lambda p: p.id),
+                **{
+                    field: sorted(set(getattr(profile, field)))
+                    for field in _PROFILE_ID_LISTS
+                },
+            }
+        )
+        for profile in model.profiles
+    ]
+
     ordered = model.model_copy(
         update={
             "archetypes": sorted(model.archetypes, key=_archetype_key),
+            "profiles": sorted(profiles, key=lambda p: p.id),
+            "contract_relationships": sorted(
+                model.contract_relationships, key=lambda r: r.id
+            ),
             "components": sorted(model.components, key=lambda c: c.id),
-            "contracts": sorted(model.contracts, key=lambda c: c.id),
+            "contracts": sorted(contracts, key=lambda c: c.id),
             "standards": sorted(model.standards, key=lambda s: s.id),
             "actors": sorted(actors, key=lambda a: a.id),
             "trust_boundaries": sorted(model.trust_boundaries, key=lambda b: b.id),
@@ -104,6 +164,10 @@ def canonicalize(model: ProtocolModel) -> ProtocolModel:
     return ordered
 
 
+def _relationship_ids(model: ProtocolModel) -> list[str]:
+    return [relationship.id for relationship in model.economics.relationships]
+
+
 def canonical_order_violations(model: ProtocolModel) -> list[str]:
     """Names of the lists that are not in canonical order. Empty means reproducible.
 
@@ -125,13 +189,19 @@ def canonical_order_violations(model: ProtocolModel) -> list[str]:
         "dependencies": [d.id for d in model.dependencies],
         "accounting.quantities": [q.id for q in model.accounting.quantities],
         "accounting.relations": [r.id for r in model.accounting.relations],
+        "economics.relationships": _relationship_ids(model),
         "economics.surfaces": [s.id for s in model.economics.surfaces],
         "documentation_rules": [r.id for r in model.documentation_rules],
         "assumptions": [a.id for a in model.assumptions],
         "invariants": [i.id for i in model.invariants],
         "risk_surfaces": [s.id for s in model.risk_surfaces],
+        "profiles": [p.id for p in model.profiles],
+        "contract_relationships": [r.id for r in model.contract_relationships],
         "gaps": [g.id for g in model.gaps],
     }
+    for profile in model.profiles:
+        by_id[f"{profile.id}.functions"] = [f.id for f in profile.functions]
+        by_id[f"{profile.id}.permissions"] = [p.id for p in profile.permissions]
     violations = [name for name, ids in by_id.items() if ids != sorted(ids)]
 
     # Archetypes rank by weight rather than by ID — the order is the meaning.

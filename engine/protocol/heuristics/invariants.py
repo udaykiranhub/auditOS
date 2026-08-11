@@ -26,9 +26,12 @@ protocol never says it.
 
 from __future__ import annotations
 
+import re
+
 from engine.core.models.evidence import (
     Confidence,
     Evidence,
+    dedupe_evidence,
     graph_evidence,
     heuristic_evidence,
     source_evidence,
@@ -55,20 +58,190 @@ DETECTOR = "invariant_model"
 
 
 def detect(index: ProtocolIndex, model: ProtocolModel) -> list[Invariant]:
-    """Candidate invariants from five independent sources, deduped by content hash."""
-    found: dict[str, Invariant] = {}
-    for invariant in (
-        *_supply_invariants(model),
-        *_conservation_invariants(model),
-        *_authorization_invariants(model),
-        *_monotonicity_invariants(model),
-        *_solvency_invariants(model),
-        *_standard_invariants(model),
-        *_documentation_invariants(model),
-    ):
-        if invariant.targets:  # validate.py rejects a targetless invariant; drop it here
-            found.setdefault(invariant.id, invariant)
-    return list(found.values())
+    """Candidate invariants from seven sources, merged by *semantic* equivalence."""
+    produced = [
+        invariant
+        for invariant in (
+            *_supply_invariants(model),
+            *_conservation_invariants(model),
+            *_authorization_invariants(model),
+            *_monotonicity_invariants(model),
+            *_solvency_invariants(model),
+            *_standard_invariants(model),
+            *_documentation_invariants(model),
+        )
+        # validate.py rejects a targetless invariant; drop it here rather than later
+        if invariant.targets
+    ]
+    return merge(produced, model)
+
+
+def merge(invariants: list[Invariant], model: ProtocolModel) -> list[Invariant]:
+    """Collapse invariants that express the *same rule* into one, with many supports.
+
+    ```
+    INV-001  convertToShares/convertToAssets consistency   (LendingPool)
+    INV-003  convertToShares/convertToAssets consistency   (Tranche)
+                              ↓
+    INV-001  … supporting_contracts = [LendingPool, Tranche]   occurrences = 2
+    ```
+
+    **Merged on structure, never on wording.** The key is
+    `(kind, source, normalized expression shape, sorted roles of the quantities involved)`
+    — computed in `semantic_key()`. Two sentences that read alike but constrain different
+    quantities keep distinct keys and stay separate; two that read differently but assert
+    the same structural rule collapse. Requiring the underlying evidence to agree is what
+    makes this a deduplication rather than a lossy summarisation.
+
+    Nothing is discarded: targets, operations, quantities, contracts and evidence are all
+    unioned onto the survivor, so the merged record cites strictly more than any input did.
+    """
+    grouped: dict[str, list[Invariant]] = {}
+    for invariant in invariants:
+        key = semantic_key(invariant, model)
+        invariant.semantic_key = key
+        grouped.setdefault(key, []).append(invariant)
+
+    merged: list[Invariant] = []
+    for key in sorted(grouped):
+        group = sorted(grouped[key], key=lambda i: i.id)
+        survivor = group[0]
+        if len(group) == 1:
+            survivor.supporting_contracts = _contracts_of(survivor, model)
+            survivor.supporting_variables = _variables_of(survivor, model)
+            merged.append(survivor)
+            continue
+
+        targets: set[str] = set()
+        operations: set[str] = set()
+        quantities: set[str] = set()
+        evidence: list[Evidence] = []
+        breaks: list[str] = []
+        for invariant in group:
+            targets.update(invariant.targets)
+            operations.update(invariant.operation_ids)
+            quantities.update(invariant.quantity_ids)
+            evidence.extend(invariant.evidence)
+            breaks.extend(b for b in invariant.breaks_if if b not in breaks)
+
+        survivor = survivor.model_copy(
+            update={
+                "targets": sorted(targets),
+                "operation_ids": sorted(operations),
+                "quantity_ids": sorted(quantities),
+                "evidence": dedupe_evidence(evidence),
+                "breaks_if": breaks[:8],
+                "occurrences": len(group),
+                "statement": _generalize(survivor, group, model),
+            }
+        )
+        survivor.supporting_contracts = _contracts_of(survivor, model)
+        survivor.supporting_variables = _variables_of(survivor, model)
+        merged.append(survivor)
+    return merged
+
+
+def semantic_key(invariant: Invariant, model: ProtocolModel) -> str:
+    """What makes two invariants *the same rule*.
+
+    Built from structure only. The wording is excluded deliberately: two detectors phrasing
+    one rule differently must still collapse, and one phrasing applied to two different
+    quantities must not.
+    """
+    roles = sorted(
+        {
+            item.role.value
+            for target in invariant.targets
+            if (item := model.state_item(f"state:{target}")) is not None
+        }
+    )
+    contracts = sorted(_contracts_of(invariant, model))
+    if invariant.source == "standard":
+        # A standard's requirement is one rule that several contracts happen to be subject
+        # to — "convertToShares and convertToAssets must be consistent" is the same ERC-4626
+        # clause whether it holds in the pool or the tranche. Keying it per contract emits
+        # the same sentence once per implementer, which is the duplication that started
+        # this refinement pass.
+        return make_invariant_id(f"{invariant.kind.value}|standard|{invariant.statement}", [])
+    if invariant.kind in (InvariantKind.SOLVENCY, InvariantKind.SUPPLY):
+        # Scoped per contract: solvency of the lending pool and solvency of a tranche are
+        # different rules, however identically they are phrased. But the *same* rule
+        # applied to three totals inside one contract is one rule.
+        return make_invariant_id(
+            f"{invariant.kind.value}|{invariant.source}|{'+'.join(roles)}", contracts
+        )
+    if invariant.kind is InvariantKind.CONFIGURATION:
+        # Documentation-sourced: the statement IS the identity, since it came from prose.
+        return make_invariant_id(invariant.statement, invariant.targets)
+    return make_invariant_id(
+        f"{invariant.kind.value}|{invariant.source}|{_shape(invariant.expression)}"
+        f"|{'+'.join(roles)}",
+        contracts or invariant.targets,
+    )
+
+
+def _shape(expression: str) -> str:
+    """Normalize an expression to its structure: `a * b / c` regardless of the names.
+
+    Two vaults computing `shares * totalAssets / totalSupply` and
+    `amount * totalDeposits / totalShares` are running the same rule; the identifiers
+    differ and the shape does not.
+    """
+    if not expression:
+        return ""
+    return re.sub(r"[A-Za-z_][A-Za-z0-9_.\[\]]*", "x", expression).replace(" ", "")
+
+
+def _generalize(
+    survivor: Invariant, group: list[Invariant], model: ProtocolModel
+) -> str:
+    """Restate a merged invariant so it does not read as being about one location only.
+
+    An invariant merged from three totals whose statement still names the first would be
+    actively misleading — the reader would think the other two are unconstrained.
+    """
+    contracts = _contracts_of(survivor, model)
+    variables = sorted(
+        {
+            item.name
+            for invariant in group
+            for target in invariant.targets
+            if (item := model.state_item(f"state:{target}")) is not None
+        }
+    )
+    if survivor.kind is InvariantKind.SOLVENCY and variables:
+        return (
+            f"The assets held must always cover {', '.join(variables[:4])}; every account "
+            "must be able to exit for its recorded share."
+        )
+    if len(contracts) > 1:
+        names = ", ".join(c.rpartition(":")[2] for c in contracts[:4])
+        return f"{survivor.statement} (holds in {names})"
+    return survivor.statement
+
+
+def _contracts_of(invariant: Invariant, model: ProtocolModel) -> list[str]:
+    contracts: set[str] = set()
+    for target in invariant.targets:
+        item = model.state_item(f"state:{target}")
+        if item is not None:
+            contracts.add(item.contract_id)
+            continue
+        operation = model.operation_for(target)
+        if operation is not None and operation.contract_id:
+            contracts.add(operation.contract_id)
+            continue
+        if model.contract(target) is not None:
+            contracts.add(target)
+    return sorted(contracts)
+
+
+def _variables_of(invariant: Invariant, model: ProtocolModel) -> list[str]:
+    return sorted(
+        target
+        for target in invariant.targets
+        if model.state_item(f"state:{target}") is not None
+    )
 
 
 def _mint(

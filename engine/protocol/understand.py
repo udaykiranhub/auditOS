@@ -66,6 +66,12 @@ from engine.protocol.heuristics import (
     operations as operations_stage,
 )
 from engine.protocol.heuristics import (
+    profiles as profiles_stage,
+)
+from engine.protocol.heuristics import (
+    relationships as relationships_stage,
+)
+from engine.protocol.heuristics import (
     roles as roles_stage,
 )
 from engine.protocol.heuristics import (
@@ -155,6 +161,17 @@ def understand(
 
     # ── 16. Honest about what is missing ──────────────────────────────────────
     model.gaps = gaps_stage.detect(index, model)
+
+    # ── 16b. The contract-level view, assembled over everything above ─────────
+    # Last of the semantic stages, and necessarily so: a profile is an *index* over the
+    # global model — its operations, its state, its invariants, its open questions — and an
+    # index cannot be built before the thing it indexes exists. Running it earlier would
+    # produce profiles that silently omit whatever had not been detected yet.
+    model.contract_relationships = relationships_stage.detect(
+        index, model.contracts, model.dependencies, model.asset_flows
+    )
+    model.profiles = profiles_stage.detect(index, model, model.contract_relationships)
+
     model.core_contracts = _core_contracts(index, model)
     model.summary = summary_stage.write(model)
     model.coverage.unmodelled = _unmodelled(index, graph)

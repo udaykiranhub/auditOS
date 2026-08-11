@@ -175,7 +175,8 @@ def extra_actors(boundaries: list[TrustBoundary]) -> list[Actor]:
     Emitted only when an outbound boundary actually exists, so a protocol that never calls
     out does not carry a phantom actor.
     """
-    if not any(b.outer == EXTERNAL_ACTOR_ID for b in boundaries):
+    outbound = [b for b in boundaries if b.outer == EXTERNAL_ACTOR_ID]
+    if not outbound:
         return []
     return [
         Actor(
@@ -183,10 +184,27 @@ def extra_actors(boundaries: list[TrustBoundary]) -> list[Actor]:
             kind=ActorKind.EXTERNAL_PROTOCOL,
             name="external-protocol",
             trust=TrustLevel.UNTRUSTED,
-            description="code outside this repository, reached by an external call",
+            description=(
+                f"code outside this repository, reached from {len(outbound)} contracts"
+            ),
+            controlled_contracts=sorted({b.inner.removeprefix("role:") for b in outbound}),
             confidence=Confidence.DERIVED,
+            # `DERIVED` has to rest on something checkable: this actor exists because the
+            # graph resolved real outbound calls, so it cites those calls rather than a
+            # sentence asserting that it does.
             evidence=[
-                heuristic_evidence(DETECTOR, "the target of every outbound trust boundary")
+                source_evidence(
+                    crossing,
+                    "calls out of the protocol; the callee is this actor",
+                    detector=DETECTOR,
+                )
+                for boundary in outbound[:3]
+                for crossing in boundary.crosses[:1]
+            ]
+            or [
+                heuristic_evidence(
+                    DETECTOR, "the target of every outbound trust boundary"
+                )
             ],
         )
     ]

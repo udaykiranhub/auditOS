@@ -338,6 +338,9 @@ def _cmd_protocol(args: argparse.Namespace) -> int:
     print()
     print(f"Contracts classified: {model.coverage.contracts_classified}"
           f"/{model.coverage.contracts_total}")
+    print(f"Contracts profiled:   {model.coverage.contracts_profiled}"
+          f"/{model.coverage.contracts_total}"
+          f"   ({model.coverage.functions_described} function bodies described)")
     print(f"Operations modelled:  {counts['operations']}"
           f"/{model.coverage.entrypoints_total} entrypoints"
           f"   ({len(model.privileged)} privileged)")

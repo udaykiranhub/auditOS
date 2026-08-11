@@ -66,7 +66,39 @@ _EXPECTED: dict[str, str] = {
     "state_id": "state",
     "transition_ids": "transition",
     "invariant_ids": "inv",
+    # 16 — the contract-level view
+    "classification_id": "role",
+    # `operation_ids` is already declared above — the profile reuses the same namespace.
+    "state_ids": "state",
+    "asset_ids": "asset",
+    "dependency_ids": "dep",
+    "surface_ids": "surface",
+    "boundary_ids": "boundary",
+    "standard_ids": "std",
+    "gap_ids": "gap",
+    "relationship_ids": "rel",
+    "edge_ids": "crel",
 }
+
+
+#: Profile fields holding `ProtocolID`s into the global model. `entrypoints`, `depends_on`
+#: and `consumed_by` hold `SolidityID`s and are checked against the `CodeModel` instead.
+_PROFILE_REFERENCE_FIELDS = (
+    "operation_ids",
+    "state_ids",
+    "actor_ids",
+    "asset_ids",
+    "dependency_ids",
+    "flow_ids",
+    "quantity_ids",
+    "relationship_ids",
+    "invariant_ids",
+    "surface_ids",
+    "boundary_ids",
+    "standard_ids",
+    "gap_ids",
+    "edge_ids",
+)
 
 
 def validate(model: ProtocolModel, code: CodeModel | None = None) -> list[str]:
@@ -118,9 +150,14 @@ def _check_ids(model: ProtocolModel) -> None:
         *(d.id for d in model.dependencies),
         *(q.id for q in model.accounting.quantities),
         *(r.id for r in model.accounting.relations),
+        *(r.id for r in model.economics.relationships),
         *(r.id for r in model.documentation_rules),
         *(a.id for a in model.assumptions),
         *(i.id for i in model.invariants),
+        *(p.id for p in model.profiles),
+        *(b.id for p in model.profiles for b in p.functions),
+        *(perm.id for p in model.profiles for perm in p.permissions),
+        *(r.id for r in model.contract_relationships),
         *(g.id for g in model.gaps),
     ]
     duplicates = sorted({pid for pid in ids if ids.count(pid) > 1})
@@ -158,10 +195,16 @@ def _check_references(model: ProtocolModel) -> None:
         *(d.id for d in model.dependencies),
         *(q.id for q in model.accounting.quantities),
         *(r.id for r in model.accounting.relations),
+        *(r.id for r in model.economics.relationships),
         *(i.id for i in model.invariants),
         *(s.id for s in model.economics.surfaces),
         *(s.id for s in model.risk_surfaces),
         *(b.id for b in model.trust_boundaries),
+        # Profiles index these three, so they have to be resolvable targets. They were not
+        # in this set before 1.2 only because nothing pointed at them.
+        *(s.id for s in model.standards),
+        *(g.id for g in model.gaps),
+        *(r.id for r in model.contract_relationships),
     }
 
     dangling: list[str] = []
@@ -197,6 +240,8 @@ def _check_references(model: ProtocolModel) -> None:
         check(operation.id, "component_id", operation.component_id)
         for actor_id in operation.actor_ids:
             check(operation.id, "actor_ids", actor_id)
+        for related_id in operation.related_operations:
+            check(operation.id, "operation_ids", related_id)
         for flow_id in operation.flow_ids:
             check(operation.id, "flow_ids", flow_id)
         for transition_id in operation.transition_ids:
@@ -223,6 +268,17 @@ def _check_references(model: ProtocolModel) -> None:
         for quantity_id in relation.quantity_ids:
             check(relation.id, "quantity_ids", quantity_id)
 
+    for relationship in model.economics.relationships:
+        # `left`/`right` are quantity or asset IDs — heterogeneous by design, so only
+        # existence is required, not a namespace.
+        for field, value in (("left", relationship.left), ("right", relationship.right)):
+            if value and value not in known:
+                dangling.append(f"{relationship.id}.{field} → {value}")
+        for relation_id in relationship.relation_ids:
+            check(relationship.id, "relation_id", relation_id)
+        for operation_id in relationship.operation_ids:
+            check(relationship.id, "operation_ids", operation_id)
+
     for invariant in model.invariants:
         check(invariant.id, "relation_id", invariant.relation_id)
         for quantity_id in invariant.quantity_ids:
@@ -238,6 +294,24 @@ def _check_references(model: ProtocolModel) -> None:
         for field, value in (("inner", boundary.inner), ("outer", boundary.outer)):
             if value and value not in known:
                 dangling.append(f"{boundary.id}.{field} → {value}")
+
+    # A profile is nothing but cross-references, so it is the record most able to rot
+    # silently — an ID list that quietly stops resolving still serializes perfectly.
+    for profile in model.profiles:
+        check(profile.id, "classification_id", profile.classification_id)
+        check(profile.id, "component_id", profile.component_id)
+        for field in _PROFILE_REFERENCE_FIELDS:
+            for value in getattr(profile, field):
+                check(profile.id, field, value)
+        for described in profile.functions:
+            for state_id in (*described.reads, *described.writes):
+                check(described.id, "state_id", state_id)
+            check(described.id, "operation_id", described.operation_id)
+        for permission in profile.permissions:
+            for actor_id in permission.actor_ids:
+                check(permission.id, "actor_ids", actor_id)
+            for state_id in permission.affected_state:
+                check(permission.id, "state_id", state_id)
 
     if mistyped:
         raise FatalError(
@@ -404,6 +478,10 @@ def _code_notes(model: ProtocolModel, code: CodeModel) -> list[str]:
             for actor in model.actors
             for capability in actor.capabilities
         ),
+        *(p.contract_id for p in model.profiles),
+        *(b.function_id for p in model.profiles for b in p.functions),
+        *(perm.function_id for p in model.profiles for perm in p.permissions),
+        *(entrypoint for p in model.profiles for entrypoint in p.entrypoints),
     }
     missing = sorted(ref for ref in cited if ref and ref not in known)
     notes: list[str] = []

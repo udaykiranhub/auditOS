@@ -11,7 +11,6 @@ import pytest
 
 from engine.core.models.evidence import Confidence, EvidenceKind
 from engine.core.models.protocol import (
-    Archetype,
     AssetKind,
     Compliance,
     Compliance as C,
@@ -329,10 +328,11 @@ def test_surfaces_ask_questions_rather_than_assert_bugs(vault):
     assert all(q.endswith("?") for q in surface.questions)
 
 
-def test_risk_surfaces_are_prioritised_and_routed_to_agents(vault):
+def test_risk_surfaces_are_prioritised_and_carry_domains(vault):
+    """Domains, not agents: which agent runs is the Orchestrator's decision (schema 1.1)."""
     surfaces = sorted(vault.risk_surfaces, key=lambda s: -s.priority)
     assert surfaces[0].priority > 0
-    assert surfaces[0].suggested_agents
+    assert surfaces[0].domains
 
 
 # ── Stage 14: documentation ───────────────────────────────────────────────────

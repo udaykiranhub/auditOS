@@ -47,6 +47,7 @@ from engine.core.models.protocol import (
     Capability,
     ContractClassification,
     ContractRole,
+    RoleAssignment,
     FlowKind,
     Invariant,
     InvariantKind,
@@ -101,7 +102,16 @@ def simple_vault_model() -> ProtocolModel:
         id=ids.make_role_id(VAULT),
         contract_id=VAULT,
         name="SimpleVault",
-        role=ContractRole.VAULT,
+        roles=[
+            RoleAssignment(
+                role=ContractRole.VAULT,
+                score=0.85,
+                confidence=Confidence.INFERRED,
+                evidence=[
+                    heuristic_evidence("vault_deposit_withdraw", "deposit + withdraw + totals")
+                ],
+            )
+        ],
         holds_funds=True,
         is_entry_contract=True,
         confidence=Confidence.INFERRED,
