@@ -143,9 +143,22 @@ def understand(
     model.dependencies = dependencies_stage.detect(index, model.contracts)
 
     # ── 12–13. Accounting, then the economics built on it ─────────────────────
-    model.accounting = accounting_stage.detect(index, model.state, model.assets, model.operations)
+    # `guards` are the relations the protocol *enforces* — read out of its own require
+    # conditions. They travel separately from `Accounting` because the economics and
+    # invariant passes need the factor and the call site, which `AccountingRelation` has
+    # nowhere to hold.
+    model.accounting, guards = accounting_stage.detect(
+        index, model.state, model.assets, model.operations, model.state_transitions
+    )
     model.economics = economics_stage.detect(
-        index, model.operations, model.accounting, model.assets, model.contracts
+        index,
+        model.operations,
+        model.accounting,
+        model.assets,
+        model.contracts,
+        guards,
+        model.dependencies,
+        model.state,
     )
     model.risk_surfaces = economics_stage.risk_surfaces(
         index, model.operations, model.contracts, model.economics, model.dependencies

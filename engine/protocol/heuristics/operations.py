@@ -328,11 +328,49 @@ def link(
     for transition in transitions:
         transitions_by_operation.setdefault(transition.operation_id, []).append(transition.id)
 
+    by_operation: dict[str, list[StateTransition]] = {}
+    for transition in transitions:
+        by_operation.setdefault(transition.operation_id, []).append(transition)
+
     for operation in operations:
         operation.flow_ids = sorted(flows_by_operation.get(operation.id, []))
         operation.transition_ids = sorted(transitions_by_operation.get(operation.id, []))
+        operation.postconditions = _postconditions(
+            by_operation.get(operation.id, []), flows, operation
+        )
 
     _link_related(operations)
+
+
+def _postconditions(
+    transitions: list[StateTransition],
+    flows: list[AssetFlow],
+    operation: Operation,
+) -> list[str]:
+    """What is true after this operation, read off the writes and transfers it performed.
+
+    The preconditions say what must hold to enter; without the matching postconditions an
+    agent has half of the contract of every function and has to re-read the body to get the
+    other half. Each line quotes a `delta_expr` the transition stage read from an assignment
+    operator, so nothing here is an interpretation of what the operation *meant* to do.
+    """
+    found: list[str] = []
+    for transition in sorted(transitions, key=lambda t: t.order):
+        if not transition.delta_expr:
+            continue
+        line = f"{transition.delta_expr} ({transition.effect})"
+        if line not in found:
+            found.append(line)
+
+    for flow in flows:
+        if flow.operation_id != operation.id or not flow.amount_expr:
+            continue
+        direction = "out" if flow.source.startswith("role:") else "in"
+        line = f"{flow.amount_expr} moves {direction} ({flow.kind.value})"
+        if line not in found:
+            found.append(line)
+
+    return found[:MAX_PRECONDITIONS]
 
 
 #: Operations that must be reasoned about together. Every accounting bug lives in the gap

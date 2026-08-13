@@ -51,6 +51,7 @@ from engine.core.models.protocol import (
     StateRole,
     TrustLevel,
 )
+from engine.protocol.heuristics.constraints import WRITE_ENFORCED
 from engine.protocol.heuristics.signatures import ProtocolIndex
 from engine.protocol.ids import make_assumption_id, make_invariant_id
 
@@ -64,6 +65,7 @@ def detect(index: ProtocolIndex, model: ProtocolModel) -> list[Invariant]:
         for invariant in (
             *_supply_invariants(model),
             *_conservation_invariants(model),
+            *_bound_invariants(model),
             *_authorization_invariants(model),
             *_monotonicity_invariants(model),
             *_solvency_invariants(model),
@@ -171,8 +173,12 @@ def semantic_key(invariant: Invariant, model: ProtocolModel) -> str:
             f"{invariant.kind.value}|{invariant.source}|{'+'.join(roles)}", contracts
         )
     if invariant.kind is InvariantKind.CONFIGURATION:
-        # Documentation-sourced: the statement IS the identity, since it came from prose.
-        return make_invariant_id(invariant.statement, invariant.targets)
+        # The statement IS the identity — it came from prose, or from a range read off a
+        # literal. Deliberately *not* scoped by contract: `startPriceMultiplier must remain
+        # at least 10000` is one rule that LiquidatorL1 and LiquidatorL2 both implement, and
+        # keying it per contract emits the identical sentence once per implementer. The
+        # merge unions their targets, so the collapsed record cites both.
+        return make_invariant_id(invariant.statement, [])
     return make_invariant_id(
         f"{invariant.kind.value}|{invariant.source}|{_shape(invariant.expression)}"
         f"|{'+'.join(roles)}",
@@ -327,15 +333,29 @@ def _supply_invariants(model: ProtocolModel) -> list[Invariant]:
 def _conservation_invariants(model: ProtocolModel) -> list[Invariant]:
     """Every accounting relation the code contains becomes a candidate that it keeps holding."""
     found: list[Invariant] = []
+    by_quantity = {q.id: q for q in model.accounting.quantities}
+    by_state = {s.id: s for s in model.state}
+
     for relation in model.accounting.relations:
-        quantities = [
-            q for q in model.accounting.quantities if q.id in relation.quantity_ids
-        ]
-        if len(quantities) < 2:
-            continue
-        targets = [_var_of(model, q) for q in quantities]
-        targets = [t for t in targets if t]
-        if not targets:
+        # In relation order, not model order. `a >= b` and `a == sum(b)` are directional,
+        # and reading them off an incidentally-ordered list produced invariants stating the
+        # reverse of what the code enforces — "deposits equals the sum of totalDeposits".
+        #
+        # `state_ids` first: a guard-derived relation is keyed on storage, because most
+        # storage never becomes an `AccountingQuantity`. Falling back to `quantity_ids`
+        # keeps the formula- and coupling-derived relations working unchanged.
+        if relation.state_ids:
+            items = [by_state[s] for s in relation.state_ids if s in by_state]
+            names = [item.name for item in items]
+            targets = [item.state_var_id for item in items]
+        else:
+            quantities = [
+                by_quantity[q] for q in relation.quantity_ids if q in by_quantity
+            ]
+            names = [quantity.name for quantity in quantities]
+            targets = [t for q in quantities if (t := _var_of(model, q))]
+
+        if len(names) < 2 or not targets:
             continue
 
         if relation.kind is RelationKind.RATIO:
@@ -347,11 +367,38 @@ def _conservation_invariants(model: ProtocolModel) -> list[Invariant]:
             breaks_if = [
                 "the denominator can be moved between the read and the write",
                 "rounding accumulates in the caller's favour across repeated calls",
-                f"{quantities[0].name} can be changed without an operation (direct transfer)",
+                f"{names[0]} can be changed without an operation (direct transfer)",
+            ]
+        elif relation.kind is RelationKind.BOUND:
+            # Read out of a condition the protocol enforces, so the invariant can quote it
+            # rather than describe it. This is the collateralisation rule on a lending
+            # market, and phrasing it as "these change together" would lose the entire
+            # content of the check.
+            statement = (
+                f"`{relation.expression}` must hold wherever it is checked: "
+                f"{names[0]} must remain sufficient to cover "
+                f"{names[1]} for every account."
+            )
+            kind = InvariantKind.SOLVENCY
+            breaks_if = [
+                f"a path increases {names[1]} without re-checking the bound",
+                f"a path decreases {names[0]} without re-checking the bound",
+                "the check reads a value that can be moved within the same transaction",
+            ]
+        elif relation.kind is RelationKind.SUM:
+            statement = (
+                f"{names[0]} must equal the sum of {names[1]} across "
+                "all accounts; no path may change one without the other."
+            )
+            kind = InvariantKind.CONSERVATION
+            breaks_if = [
+                f"a path writes {names[1]} and returns before writing "
+                f"{names[0]}",
+                "an account's entry is cleared without decrementing the total",
             ]
         else:
             statement = (
-                f"{' and '.join(q.name for q in quantities)} must change together; neither "
+                f"{' and '.join(names)} must change together; neither "
                 "may be updated without the other."
             )
             kind = InvariantKind.CONSERVATION
@@ -371,6 +418,90 @@ def _conservation_invariants(model: ProtocolModel) -> list[Invariant]:
             )
         )
     return found
+
+
+#: The comparison a relation ended up in, as a readable range side.
+_RANGE_SIDE = {">=": "at least", ">": "greater than", "<=": "at most", "<": "less than"}
+
+
+def _bound_invariants(model: ProtocolModel) -> list[Invariant]:
+    """A single variable constrained against a constant — the bounded-configuration rule.
+
+    ```
+    if (startPriceMultiplier_ < 10_000) revert
+    if (startPriceMultiplier_ > 30_000) revert
+    → startPriceMultiplier must stay within [10000, 30000]
+    ```
+
+    This is where most of a real protocol's checkable properties actually live. The two
+    halves of a range are written as two separate guards, usually on consecutive lines, and
+    reporting them as two invariants loses the fact that they are one rule — so they are
+    merged here on the variable they constrain.
+
+    A parameter validated and then written to storage counts, because that setter is the
+    only path that writes it; the invariant says so rather than implying the bound holds
+    for writes it never saw.
+    """
+    by_state = {item.id: item for item in model.state}
+    ranges: dict[str, dict[str, tuple[str, str]]] = {}
+
+    for relation in model.accounting.relations:
+        if relation.kind is not RelationKind.BOUND or len(relation.state_ids) != 1:
+            continue
+        # Only a bound checked on the path that writes the variable justifies a standing
+        # range. `if (auctionsInProgress > 0) revert` inside `addTranche` is a precondition
+        # of that operation and says nothing about what the variable may hold in general —
+        # reporting it as "auctionsInProgress must remain at most 0" is simply false.
+        if not relation.holds_when.startswith(WRITE_ENFORCED):
+            continue
+        bound = _literal_of(relation.expression)
+        if bound is None:
+            continue
+        state_id, (operator, literal) = relation.state_ids[0], bound
+        ranges.setdefault(state_id, {})[operator] = (literal, relation.expression)
+
+    found: list[Invariant] = []
+    for state_id, sides in sorted(ranges.items()):
+        item = by_state.get(state_id)
+        if item is None:
+            continue
+
+        clauses = [
+            f"{_RANGE_SIDE[operator]} {literal}"
+            for operator, (literal, _) in sorted(sides.items())
+            if operator in _RANGE_SIDE
+        ]
+        if not clauses:
+            continue
+
+        expressions = [expression for _, expression in sides.values()]
+        found.append(
+            _mint(
+                f"{item.name} must remain {' and '.join(clauses)}; every path that "
+                "writes it enforces this range.",
+                InvariantKind.CONFIGURATION,
+                [item.state_var_id],
+                [
+                    source_evidence(item.state_var_id, expression, detector=DETECTOR)
+                    for expression in expressions[:3]
+                ],
+                expression=" and ".join(expressions),
+                breaks_if=[
+                    f"a path writes {item.name} without re-checking the range",
+                    "the bound is applied to a parameter that is cast before it is stored",
+                ],
+                holds_when="checked on entry to every setter that writes it",
+            )
+        )
+    return found
+
+
+def _literal_of(expression: str) -> tuple[str, str] | None:
+    """`cutoffTime_ <= 64800` → `("<=", "64800")`, for the single-variable bound shapes."""
+    match = re.search(r"(>=|<=|>|<)\s*([\d_]+)\s*$", expression.strip())
+    if match is None:
+        return None
+    return match.group(1), match.group(2).replace("_", "")
 
 
 def _authorization_invariants(model: ProtocolModel) -> list[Invariant]:

@@ -43,7 +43,10 @@ from engine.core.models.protocol import (
     RelationKind,
     StateItem,
     StateRole,
+    StateTransition,
 )
+from engine.protocol.heuristics import constraints
+from engine.protocol.heuristics.constraints import GuardRelation
 from engine.protocol.heuristics.signatures import ProtocolIndex
 from engine.protocol.ids import make_quantity_id, make_relationship_id
 
@@ -80,13 +83,25 @@ def detect(
     state: list[StateItem],
     assets: list[Asset],
     operations: list[Operation],
-) -> Accounting:
-    """Quantities from the state model, relations from the source that combines them."""
+    transitions: list[StateTransition],
+) -> tuple[Accounting, list[GuardRelation]]:
+    """Quantities from the state model, relations from the source that combines them.
+
+    Returns the guard-derived relations alongside the model: they carry a factor and a call
+    site that `AccountingRelation` cannot hold, and the economics and invariant passes both
+    need them. Recomputing them downstream would risk the two copies disagreeing.
+    """
     asset_by_id = {asset.id: asset for asset in assets}
     quantities = _quantities(state, asset_by_id, operations)
     by_name = {q.name.lower(): q for q in quantities}
 
+    # Guard-derived relations come first: they quote a condition the protocol enforces,
+    # which is stronger evidence than a formula matched out of a body or a coupling
+    # inferred from two quantities moving together.
+    guard_relations, guards = constraints.detect(index, state, operations)
     relations = [
+        *guard_relations,
+        *constraints.conservation(state, transitions),
         *_textual_relations(index, by_name),
         *_conservation_relations(quantities, operations),
     ]
@@ -94,7 +109,7 @@ def detect(
         quantities=quantities,
         relations=relations,
         unit_conflicts=_unit_conflicts(quantities, relations, by_name),
-    )
+    ), guards
 
 
 def _quantities(

@@ -454,6 +454,23 @@ export interface RiskSurfaceRow {
    * The model describes the surface; the Orchestrator picks agents from its own registry.
    */
   domains: string[]
+  /** What to actually ask here. A question survives being wrong; an assertion does not. */
+  questions: string[]
+}
+
+/** A pairing between two economic quantities: `deposits ↕ debt`, `assets ↕ shares`. */
+export interface RelationshipRow {
+  id: string
+  left: string
+  right: string
+  left_name: string
+  right_name: string
+  /** How they are coupled: `deposits must cover 2x debt`. Descriptive, never a verdict. */
+  nature: string
+  status: 'formula' | 'structural' | 'expected_missing'
+  /** Verbatim from the source when `status` is `formula`; empty otherwise. */
+  formula: string
+  open_question: string
 }
 
 export interface DocConflictRow {
@@ -654,6 +671,8 @@ export interface ProtocolSummary {
   open_questions: OpenQuestionRow[]
   /** The contract-level view (schema 1.2), ranked by centrality. */
   profiles: ProfileRow[]
+  /** How the protocol's quantities constrain each other (schema 1.3). */
+  relationships: RelationshipRow[]
   enrichment: EnrichmentRow
   notes: string[]
 }

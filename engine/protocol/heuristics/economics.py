@@ -41,12 +41,15 @@ from engine.core.models.protocol import (
     Invariant,
     Operation,
     OperationKind,
+    RelationKind,
     RelationshipStatus,
     RiskSurface,
+    StateItem,
     StateRole,
     SurfaceDomain,
     SurfaceKind,
 )
+from engine.protocol.heuristics.constraints import GuardRelation
 from engine.protocol.heuristics.signatures import ProtocolIndex
 from engine.protocol.ids import make_relationship_id, make_surface_id
 
@@ -184,6 +187,61 @@ BY_OPERATION: dict[OperationKind, tuple[tuple[SurfaceKind, str, tuple[str, ...]]
     ),
 }
 
+#: Surfaces that only exist if the protocol has the machinery they are about, and the
+#: machinery that counts. Absent from this table means "the operation shape is enough".
+#:
+#: Without this gate, every `deposit` reported a first-depositor share-inflation surface and
+#: every `borrow` reported an oracle-manipulation surface — including on protocols with no
+#: shares and no oracle. Those are conventional hazards of the *archetype*, and asserting
+#: them against a contract that has neither is describing a protocol that does not exist.
+REQUIRES: dict[SurfaceKind, frozenset[str]] = {
+    SurfaceKind.FIRST_DEPOSITOR: frozenset({"shares"}),
+    SurfaceKind.SHARE_PRICING: frozenset({"shares"}),
+    SurfaceKind.INFLATION: frozenset({"shares"}),
+    SurfaceKind.ROUNDING: frozenset({"shares", "rate"}),
+    SurfaceKind.ORACLE_PRICING: frozenset({"oracle", "price"}),
+    SurfaceKind.SLIPPAGE: frozenset({"dex"}),
+}
+
+
+def _machinery(
+    accounting: Accounting, assets: list[Asset], dependencies: list[Dependency]
+) -> frozenset[str]:
+    """Which of the mechanisms in `REQUIRES` this protocol demonstrably has.
+
+    Every membership below is read off a record another stage produced with its own
+    evidence — a share-supply state role, a priced quantity, an oracle dependency — never
+    off a contract name or an archetype label.
+    """
+    present: set[str] = set()
+
+    for quantity in accounting.quantities:
+        lowered = quantity.name.lower()
+        if quantity.unit == "shares" or "share" in lowered:
+            present.add("shares")
+        if quantity.unit == "ratio" or "price" in lowered or "rate" in lowered:
+            present.add("rate")
+            present.add("price")
+
+    if any(asset.kind is AssetKind.SHARE for asset in assets):
+        present.add("shares")
+
+    for relation in accounting.relations:
+        # A division combining two quantities is where rounding is felt, whether or not the
+        # protocol calls the result a share.
+        if relation.kind is RelationKind.RATIO:
+            present.add("rate")
+
+    for dependency in dependencies:
+        if dependency.kind is DependencyKind.ORACLE:
+            present.add("oracle")
+            present.add("price")
+        if dependency.kind is DependencyKind.DEX:
+            present.add("dex")
+
+    return frozenset(present)
+
+
 #: Surfaces implied by a dependency rather than by an operation.
 BY_DEPENDENCY: dict[DependencyKind, tuple[SurfaceKind, str]] = {
     DependencyKind.ORACLE: (SurfaceKind.ORACLE_PRICING, "prices come from outside"),
@@ -225,14 +283,25 @@ def detect(
     accounting: Accounting,
     assets: list[Asset],
     classifications: list[ContractClassification],
+    guards: list[GuardRelation] | None = None,
+    dependencies: list[Dependency] | None = None,
+    state: list[StateItem] | None = None,
 ) -> EconomicModel:
     """How value enters, moves and leaves — plus the surfaces where it can go wrong."""
     surfaces: dict[str, EconomicSurface] = {}
+    present = _machinery(accounting, assets, dependencies or [])
 
     for operation in operations:
         if operation.is_view:
             continue
         for kind, description, questions in BY_OPERATION.get(operation.kind, ()):
+            # A conventional hazard of the operation *shape* is only a surface here if the
+            # protocol has the machinery the hazard is about. `SimpleLending` has no shares
+            # and no oracle, and reporting "the first deposit sets the initial exchange
+            # rate" or "collateral is valued at borrow time" against it describes a
+            # different protocol — the invented semantics this artifact exists to avoid.
+            if kind in REQUIRES and not (REQUIRES[kind] & present):
+                continue
             surface_id = make_surface_id(kind.value, operation.function_id)
             surfaces.setdefault(
                 surface_id,
@@ -289,7 +358,9 @@ def detect(
         reward_sources=_reward_sources(assets),
         incentives=_incentives(operations),
         value_capture=_value_capture(accounting),
-        relationships=relationships(accounting, operations, classifications),
+        relationships=relationships(
+            accounting, operations, classifications, guards or [], state
+        ),
         surfaces=list(surfaces.values()),
     )
 
@@ -310,6 +381,8 @@ def relationships(
     accounting: Accounting,
     operations: list[Operation],
     classifications: list[ContractClassification],
+    guards: list[GuardRelation] | None = None,
+    state: list[StateItem] | None = None,
 ) -> list[EconomicRelationship]:
     """The `assets ↕ shares`, `collateral ↕ debt` pairings, with their status stated.
 
@@ -412,7 +485,86 @@ def relationships(
                     evidence=evidence,
                 )
                 found.setdefault(relationship.id, relationship)
-    return list(found.values())
+
+    # Guard-derived pairings last in code, first in precedence: `setdefault` above has
+    # already claimed the role-table pairings, so these overwrite them deliberately. A
+    # relationship the protocol *enforces* in a reverting condition outranks one inferred
+    # from two quantities sharing an operation, and outranks an `EXPECTED_MISSING` question
+    # asking whether the link exists — it demonstrably does.
+    for relationship in _from_guards(guards or [], state or []):
+        found[relationship.id] = relationship
+
+    return sorted(found.values(), key=lambda r: r.id)
+
+
+def _from_guards(
+    guards: list[GuardRelation], state: list[StateItem]
+) -> list[EconomicRelationship]:
+    """Pairings the source states outright, in a condition that reverts when it fails.
+
+    Keyed on storage rather than on `AccountingQuantity`: a quantity exists only where the
+    state pass inferred a role it recognises, which on a real protocol is a small minority
+    of its variables. Every constrained variable has a `StateItem`, so keying here is what
+    lets the pass say anything at all about code that is not vault-shaped.
+
+    A relationship whose bounding side is a literal (`startPriceMultiplier >= 10000`) is a
+    *range on one variable*, not a pairing between two, and is left to the invariant pass —
+    this list is about how two parts of the protocol constrain each other.
+    """
+    by_id = {item.id: item for item in state}
+    produced: dict[str, EconomicRelationship] = {}
+
+    for guard in guards:
+        if not guard.right:
+            continue
+        left = by_id.get(guard.left[0])
+        right = by_id.get(guard.right[0])
+        if left is None or right is None:
+            continue
+
+        nature = _nature_of(guard, _joined(guard.left, by_id), _joined(guard.right, by_id))
+        identifier = make_relationship_id(
+            "economic:guard", [*guard.left, *guard.right]
+        )
+        produced[identifier] = EconomicRelationship(
+            id=identifier,
+            left=left.id,
+            right=right.id,
+            nature=nature,
+            status=RelationshipStatus.FORMULA,
+            formula=guard.expression,
+            operation_ids=[guard.operation_id] if guard.operation_id else [],
+            # `DERIVED`, not `STATED`: the condition is quoted from code that enforces it,
+            # but nobody wrote it down as a rule the protocol promises.
+            confidence=Confidence.DERIVED,
+            evidence=[
+                source_evidence(
+                    guard.function_id,
+                    guard.expression,
+                    detector=DETECTOR,
+                )
+            ],
+        )
+    return list(produced.values())
+
+
+def _joined(ids: tuple[str, ...], by_id: dict[str, StateItem]) -> str:
+    """`initiationWeight + penaltyWeight + terminationWeight` — a summed side, readably."""
+    names = [by_id[i].name for i in ids if i in by_id]
+    return " + ".join(names)
+
+
+def _nature_of(guard: GuardRelation, left: str, right: str) -> str:
+    """How the two are coupled, in the vocabulary an auditor uses.
+
+    Descriptive only. It never says the coupling is wrong, exploitable, or insufficient —
+    `nature` is what the relationship *is*, and judging it belongs to an agent.
+    """
+    if guard.kind is RelationKind.EQUALITY:
+        return f"{left} equals {right}"
+    if guard.factor:
+        return f"{left} must cover {guard.factor}x {right}"
+    return f"{left} bounds {right}"
 
 
 def _role_of(quantity: AccountingQuantity, accounting: Accounting) -> StateRole:
@@ -538,6 +690,9 @@ def risk_surfaces(
             # surfaces titled identically, which reads as duplication and is not.
             title=_title(economic.description, contract_id),
             description=" ".join(economic.questions),
+            # Carried as a list, not only flattened into `description`. An agent consuming
+            # this needs them one at a time — each is a separate thing to go and check.
+            questions=list(economic.questions),
             targets=targets,
             contract_id=contract_id,
             actors=list(economic.actors),

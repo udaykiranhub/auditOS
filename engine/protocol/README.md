@@ -40,6 +40,7 @@ python -m engine protocol <path> --enrich --verify  # optional layers
 | `heuristics/state.py` | what storage means, and how operations move it | 9, 10 |
 | `heuristics/dependencies.py` | what outside this repo correctness rests on | 11 |
 | `heuristics/accounting.py` | the numbers, and how they relate | 12 |
+| `heuristics/constraints.py` | couplings read out of the guards that enforce them | 12b |
 | `heuristics/economics.py` | where value is created, lost, redistributed | 13 |
 | `heuristics/docs.py` | what the docs claim, and whether code agrees | 14 |
 | `heuristics/invariants.py` | candidate invariants and their assumptions | 15 |
@@ -260,6 +261,35 @@ Full rationale, the three semantic defects real output exposed, before/after num
 New endpoints: `GET /protocol/profiles` (one line per contract) and
 `GET /protocol/profiles/{contract}` (one contract in full, addressed by `SolidityID` or by
 name). The summary carries profile names only — the bodies are most of the artifact.
+
+## Schema 1.3 — the couplings between quantities
+
+1.2 described every contract and every function and still answered a small lending market
+with a *list*. The question nothing answered was the one an agent actually has: **how does
+`deposits` relate to `debt`?**
+
+Relationships used to be paired from a table of `StateRole` couples, which misses any
+protocol that names its collateral something else — and widening the table would assert the
+link from two names. The evidence is in the source instead:
+
+```solidity
+require(deposits[msg.sender] - amount >= debt[msg.sender] * 2);
+```
+
+A guard comparing two state variables is the protocol stating the relationship itself, in a
+line that reverts when it fails. `constraints.py` reads relations out of those conditions and
+emits three linked records from one fact: an `AccountingRelation`, an `EconomicRelationship`
+with the condition quoted, and a `SOLVENCY` invariant. Conservation (`totalDeposits ==
+Σ deposits[account]`) comes from a *complete* correspondence between a total and its mapping
+— one operation that writes one without the other disqualifies the pair.
+
+The same pass fixed a second defect the example exposed: `deposit` reported a first-depositor
+share-inflation surface and `borrow` an oracle-manipulation surface **on a protocol with no
+shares and no oracle**. `REQUIRES` now gates those on machinery the protocol demonstrably
+has. Real vaults keep their surfaces; invented ones are gone.
+
+Rationale, the before/after numbers and the 1.2 → 1.3 migration table are in
+[CONSTRAINTS.md](CONSTRAINTS.md).
 
 ## Canonical ordering is not cosmetic
 

@@ -64,7 +64,14 @@ from engine.core.models.evidence import Claim, Confidence, Evidence, EvidenceKin
 #     effect sequences, which is what makes CEI, ordering and accounting reasoning possible
 #   + Permission — *how* a function is gated, not merely whether it is
 #   + ContractRelationship — the cross-contract graph as first-class records
-SCHEMA_VERSION = "1.2.0"
+#
+# 1.3 — the couplings between quantities, read out of the conditions the protocol enforces
+# on itself rather than inferred from a role-pair table. Purely additive.
+#   + RiskSurface.questions — the questions were being flattened into one description
+#     string; an agent needs them one at a time, because each is a separate thing to check
+#   + Operation.postconditions now populated — preconditions without postconditions is half
+#     a contract per function, and the other half was a re-read of the body away
+SCHEMA_VERSION = "1.3.0"
 
 ARTIFACT_NAME = "protocol"
 
@@ -892,6 +899,15 @@ class AccountingRelation(Claim):
     """As close to the source as possible: `assets == shares * totalAssets / totalSupply`."""
 
     quantity_ids: list[str] = Field(default_factory=list)
+    state_ids: list[str] = Field(default_factory=list)
+    """The storage this relation constrains, when it was read out of a guard.
+
+    Separate from `quantity_ids` because an `AccountingQuantity` exists only where the state
+    pass inferred a role it recognises — 3 of 49 variables on a real lending protocol. A
+    constraint keyed on quantities can therefore say nothing about most of a codebase, while
+    every constrained variable has a `StateItem`. Order carries meaning: position 0 is the
+    constrained side, so this list is deliberately not sorted."""
+
     holds_when: str = ""
     rounding: str = ""
     """`down`, `up`, `unspecified`. Which way a division rounds decides who absorbs the
@@ -1225,6 +1241,14 @@ class RiskSurface(Claim):
     assets: list[str] = Field(default_factory=list)
     invariant_ids: list[str] = Field(default_factory=list)
     priority: float = 0.0  # 0..1
+
+    questions: list[str] = Field(default_factory=list)
+    """What to actually ask here, phrased as questions.
+
+    A question survives being wrong; an assertion does not. "can the rate be moved within
+    the same transaction as the withdrawal?" points an agent at a specific thing to check
+    and stays honest if the answer is no — which is what separates an investigation target
+    from a finding this artifact has no business making."""
 
     domains: list[SurfaceDomain] = Field(default_factory=list)
     """What kind of reasoning this calls for. **Replaces `suggested_agents` (schema 1.1).**

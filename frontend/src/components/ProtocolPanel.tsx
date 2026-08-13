@@ -576,6 +576,72 @@ export default function ProtocolPanel({
 
       {tab === 'invariants' && (
         <div className="flex flex-col gap-3">
+          {/* The relationships come first: an invariant is a rule *over* these quantities,
+              and reading the rules without the couplings they constrain is the "list of
+              facts" problem this section exists to solve. */}
+          {protocol.relationships.length > 0 && (
+            <div>
+              <h3 className="text-sm font-semibold">How the quantities constrain each other</h3>
+              <p className="mt-0.5 text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                Read out of the conditions the protocol enforces on itself — quoted, not
+                inferred from naming.
+              </p>
+              <ul className="mt-2 flex flex-col gap-2">
+                {protocol.relationships.map((row) => (
+                  <li
+                    key={row.id}
+                    className="rounded-lg p-2.5"
+                    style={{ background: 'var(--surface-1)' }}
+                  >
+                    <div className="mono flex flex-wrap items-center gap-2 text-[11px]">
+                      <span style={{ color: 'var(--series-1)' }}>{row.left_name}</span>
+                      <span style={{ color: 'var(--text-muted)' }}>──{row.nature}──▶</span>
+                      <span style={{ color: 'var(--series-2)' }}>{row.right_name}</span>
+                      <span
+                        title={
+                          row.status === 'formula'
+                            ? 'the source contains a condition combining the two'
+                            : row.status === 'structural'
+                              ? 'they move under the same operations — coupling, not a proven law'
+                              : 'the shape implies a link the code does not show'
+                        }
+                        className="rounded px-1 text-[9px]"
+                        style={{
+                          background:
+                            row.status === 'formula'
+                              ? 'color-mix(in srgb, var(--series-1) 18%, transparent)'
+                              : 'transparent',
+                          color:
+                            row.status === 'formula'
+                              ? 'var(--series-1)'
+                              : 'var(--text-muted)',
+                        }}
+                      >
+                        {row.status}
+                      </span>
+                    </div>
+                    {row.formula && (
+                      <pre
+                        className="mono mt-1.5 overflow-x-auto text-[10px]"
+                        style={{ color: 'var(--text-secondary)' }}
+                      >
+                        {row.formula}
+                      </pre>
+                    )}
+                    {row.open_question && (
+                      <p
+                        className="mt-1 text-[11px]"
+                        style={{ color: 'var(--status-warning)' }}
+                      >
+                        {row.open_question}
+                      </p>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
           <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
             Every one of these is a <strong>candidate</strong> until something executes it.
             Nothing deterministic promotes past “supported”; only a Forge run reaches
@@ -669,6 +735,19 @@ export default function ProtocolPanel({
                   ))}
                 </div>
                 <p className="mt-1.5 text-xs">{surface.title}</p>
+                {surface.questions.length > 0 && (
+                  <ul className="mt-1.5 flex flex-col gap-0.5">
+                    {surface.questions.map((question) => (
+                      <li
+                        key={question}
+                        className="text-[11px]"
+                        style={{ color: 'var(--text-secondary)' }}
+                      >
+                        → {question}
+                      </li>
+                    ))}
+                  </ul>
+                )}
                 <div className="mono mt-1 text-[10px]" style={{ color: 'var(--text-muted)' }}>
                   {surface.targets.map(short).join(' · ')}
                 </div>

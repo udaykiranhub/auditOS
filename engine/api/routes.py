@@ -591,6 +591,7 @@ def protocol_summary(run_id: str) -> dict[str, Any]:
                 "priority": s.priority,
                 "targets": s.targets[:4],
                 "domains": [d.value for d in s.domains],
+                "questions": s.questions,
             }
             for s in sorted(model.risk_surfaces, key=lambda s: -s.priority)[:10]
         ],
@@ -605,6 +606,22 @@ def protocol_summary(run_id: str) -> dict[str, Any]:
                 "unknowns": len(p.unknowns),
             }
             for p in sorted(model.profiles, key=lambda p: -p.centrality)[:20]
+        ],
+        # How the quantities constrain each other. Names are resolved here because the
+        # UI would otherwise have to fetch the accounting model just to render an ID.
+        "relationships": [
+            {
+                "id": r.id,
+                "left": r.left,
+                "right": r.right,
+                "left_name": _quantity_name(model, r.left),
+                "right_name": _quantity_name(model, r.right),
+                "nature": r.nature,
+                "status": r.status.value,
+                "formula": r.formula,
+                "open_question": r.open_question,
+            }
+            for r in model.economics.relationships
         ],
         "documentation_conflicts": [
             {"statement": r.statement, "finding": r.finding, "subjects": r.subject_ids}
@@ -710,6 +727,14 @@ def get_ast(run_id: str, path: str) -> dict:
     if not target.is_relative_to(run_dir / "build" / "ast") or not target.is_file():
         raise HTTPException(status_code=404, detail={"message": f"No such AST: {path}"})
     return json.loads(target.read_text(encoding="utf-8"))
+
+
+def _quantity_name(model: ProtocolModel, quantity_id: str) -> str:
+    """The source name behind a quantity ID, so a UI need not fetch the accounting model."""
+    found = next(
+        (q for q in model.accounting.quantities if q.id == quantity_id), None
+    )
+    return found.name if found is not None else quantity_id.rpartition("#")[2]
 
 
 def _load_repo(run_id: str) -> RepoModel:
