@@ -240,6 +240,17 @@ RULES: tuple[RoleRule, ...] = (
             "latestAnswer",
             "latestRoundData",
             "getPrice",
+            # A price getter is almost never spelled `getPrice()`. Chainlink says
+            # `latestRoundData`, Compound says `getUnderlyingPrice`, Aave says
+            # `getAssetPrice`, and the requirement is prefix-matched — so a list holding
+            # only the idealised spelling classified a textbook price oracle as `unknown`.
+            "getAssetPrice",
+            "getUnderlyingPrice",
+            "getAssetValue",
+            "getAmountFromValue",
+            "setPrice",
+            "registerFeed",
+            "getFeed",
             "getRate",
             "consult",
             "peek",
@@ -247,9 +258,27 @@ RULES: tuple[RoleRule, ...] = (
             "isActive",
             "decommissionOracle",
         ),
-        storage=("priceFeed", "aggregator", "twap", "observations", "oracleInformation"),
+        storage=(
+            "priceFeed",
+            "aggregator",
+            "twap",
+            "observations",
+            "oracleInformation",
+            "feeds",
+            "stalenessThreshold",
+        ),
         names=("oracle", "pricefeed", "aggregator", "om", "chainlink", "redstone", "pyth"),
-        requires=("getPrice", "latestAnswer", "latestRoundData", "peek", "consult", "addOracle"),
+        requires=(
+            "getPrice",
+            "getAssetPrice",
+            "getUnderlyingPrice",
+            "latestAnswer",
+            "latestRoundData",
+            "peek",
+            "consult",
+            "addOracle",
+            "registerFeed",
+        ),
     ),
     RoleRule(
         ContractRole.STAKING,

@@ -27,6 +27,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from engine.core.errors import FatalError
+from engine.core.models.build import BuildModel
 from engine.core.models.code import CodeModel
 from engine.core.models.graph import GraphModel
 from engine.core.models.protocol import ARTIFACT_NAME, ProtocolIdentity, ProtocolModel
@@ -85,6 +86,9 @@ from engine.protocol.heuristics import (
 )
 from engine.protocol.heuristics.signatures import ProtocolIndex
 from engine.protocol.ids import make_protocol_id
+from engine.protocol.semantic import build as semantic_stage
+from engine.protocol.semantic import solc_ast
+from engine.protocol.semantic import surfaces as semantic_surfaces
 
 
 class UnderstandCode:
@@ -94,9 +98,19 @@ class UnderstandCode:
 
 
 def understand(
-    code: CodeModel, graph: GraphModel, repo: RepoModel | None = None
+    code: CodeModel,
+    graph: GraphModel,
+    repo: RepoModel | None = None,
+    build: BuildModel | None = None,
+    run_dir: Path | None = None,
 ) -> ProtocolModel:
-    """Run all seventeen stages. Deterministic; no network access of any kind."""
+    """Run all seventeen stages. Deterministic; no network access of any kind.
+
+    `build` and `run_dir` are optional and together unlock the semantic graph: the build
+    stage writes one solc AST per source, and those two arguments are what locate them. When
+    they are absent — no compile, or a caller that predates them — the graph is built at
+    text fidelity and says so, rather than the pipeline refusing to run.
+    """
     if not code.in_scope_contracts:
         raise FatalError(
             "No in-scope contracts to interpret.",
@@ -142,6 +156,13 @@ def understand(
     # ── 11. External dependencies ─────────────────────────────────────────────
     model.dependencies = dependencies_stage.detect(index, model.contracts)
 
+    # ── 12a. The semantic graph, from the AST the build stage already wrote ───
+    # Runs before accounting because everything downstream should eventually be a
+    # *query* over this graph rather than a lookup in a table keyed by operation name.
+    # A table gives two protocols with a `deposit` identical output; a graph gives each
+    # the answer its own code supports.
+    model.semantic = semantic_stage.build(solc_ast.load(build, run_dir), code)
+
     # ── 12–13. Accounting, then the economics built on it ─────────────────────
     # `guards` are the relations the protocol *enforces* — read out of its own require
     # conditions. They travel separately from `Accounting` because the economics and
@@ -160,9 +181,17 @@ def understand(
         model.dependencies,
         model.state,
     )
-    model.risk_surfaces = economics_stage.risk_surfaces(
+    # Graph-derived surfaces first, then the conventional ones. The two are different
+    # kinds of claim and are deliberately not merged: a derived surface matched a pattern
+    # in *this* protocol's graph and names the node it matched on, while a conventional one
+    # says "protocols shaped like this usually have this hazard". Ranking the derived ones
+    # above is not a preference — it is the difference between an observation and a prior.
+    derived = semantic_surfaces.derive(model.semantic)
+    conventional = economics_stage.risk_surfaces(
         index, model.operations, model.contracts, model.economics, model.dependencies
     )
+    seen = {surface.id for surface in derived}
+    model.risk_surfaces = [*derived, *(s for s in conventional if s.id not in seen)]
 
     # ── 14. What the docs claim, and whether the code agrees ──────────────────
     model.documentation_rules = docs_stage.detect(index, repo, model)
@@ -194,10 +223,14 @@ def understand(
 
 
 def understand_and_save(
-    code: CodeModel, graph: GraphModel, run_dir: Path, repo: RepoModel | None = None
+    code: CodeModel,
+    graph: GraphModel,
+    run_dir: Path,
+    repo: RepoModel | None = None,
+    build: BuildModel | None = None,
 ) -> tuple[ProtocolModel, Path]:
     """`understand` + persist to ``run/<run_id>/artifacts/protocol.json``."""
-    return save(understand(code, graph, repo), run_dir)
+    return save(understand(code, graph, repo, build, run_dir), run_dir)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

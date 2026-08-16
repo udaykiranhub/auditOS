@@ -17,6 +17,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
 import { fetchProfile, fetchProfiles } from '../api/client'
+import ContractMechanisms from './ContractMechanisms'
 import type { ClaimConfidence, FunctionBehavior, ProtocolSummary } from '../types/repo'
 
 /** The ladder, weakest first. Colour tracks *how the claim was made*, not how alarming it is. */
@@ -73,7 +74,7 @@ const STATUS_COLOR: Record<string, string> = {
   unverifiable: 'var(--text-muted)',
 }
 
-type Tab = 'overview' | 'contracts' | 'invariants' | 'risk' | 'limits'
+type Tab = 'overview' | 'mechanisms' | 'contracts' | 'invariants' | 'risk' | 'limits'
 
 /** Effect kind → how it reads in the sequence. Colour marks where control leaves the frame. */
 const STEP_STYLE: Record<string, { glyph: string; color: string }> = {
@@ -429,6 +430,7 @@ export default function ProtocolPanel({
         {(
           [
             { key: 'overview', label: 'Overview' },
+            { key: 'mechanisms', label: 'How it works' },
             { key: 'contracts', label: `Contracts (${protocol.profiles.length})` },
             { key: 'invariants', label: `Invariants (${protocol.invariants.length})` },
             { key: 'risk', label: `Risk surfaces (${protocol.top_risk_surfaces.length})` },
@@ -571,6 +573,8 @@ export default function ProtocolPanel({
           )}
         </div>
       )}
+
+      {tab === 'mechanisms' && <ContractMechanisms runId={runId} />}
 
       {tab === 'contracts' && <ContractsTab runId={runId} />}
 

@@ -38,6 +38,7 @@ from engine.core.models.evidence import (
 )
 from engine.core.models.protocol import (
     AccountingQuantity,
+    AccountingRelation,
     Assumption,
     Compliance,
     Invariant,
@@ -66,6 +67,7 @@ def detect(index: ProtocolIndex, model: ProtocolModel) -> list[Invariant]:
             *_supply_invariants(model),
             *_conservation_invariants(model),
             *_bound_invariants(model),
+            *_guard_rule_invariants(model),
             *_authorization_invariants(model),
             *_monotonicity_invariants(model),
             *_solvency_invariants(model),
@@ -369,6 +371,20 @@ def _conservation_invariants(model: ProtocolModel) -> list[Invariant]:
                 "rounding accumulates in the caller's favour across repeated calls",
                 f"{names[0]} can be changed without an operation (direct transfer)",
             ]
+        elif relation.kind is RelationKind.BOUND and _is_constant_cap(model, relation):
+            # A constant on the constrained side is a *ceiling*, not a solvency relation.
+            # `MAX_FEE_BPS >= feeBps` says the fee may never exceed the cap; phrasing it as
+            # "MAX_FEE_BPS must remain sufficient to cover feeBps for every account" reads
+            # as an accounting property of a value that cannot change.
+            statement = (
+                f"{names[1]} must never exceed {names[0]}, which is a compile-time "
+                "constant; every path that writes it enforces the ceiling."
+            )
+            kind = InvariantKind.CONFIGURATION
+            breaks_if = [
+                f"a path writes {names[1]} without checking it against {names[0]}",
+                "the value is cast to a narrower type after the check",
+            ]
         elif relation.kind is RelationKind.BOUND:
             # Read out of a condition the protocol enforces, so the invariant can quote it
             # rather than describe it. This is the collateralisation rule on a lending
@@ -414,6 +430,84 @@ def _conservation_invariants(model: ProtocolModel) -> list[Invariant]:
                 quantity_ids=relation.quantity_ids,
                 relation_id=relation.id,
                 breaks_if=breaks_if,
+                holds_when=relation.holds_when,
+            )
+        )
+    return found
+
+
+#: Names that read as an amount of value. Used only to pick an invariant's *kind*, never to
+#: decide whether the rule exists — that is settled by the guard.
+_VALUE_TERMS = (
+    "debt",
+    "collateral",
+    "borrow",
+    "supply",
+    "balance",
+    "liquidity",
+    "limit",
+    "shares",
+    "assets",
+    "usd",
+)
+
+
+def _guard_rule_invariants(model: ProtocolModel) -> list[Invariant]:
+    """Rules the code enforces between two named quantities that are not storage slots.
+
+    ```
+    if (account.totalDebtUsd > account.borrowLimitUsd) revert HealthFactorTooLow(…);
+    → borrowLimitUsd >= totalDebtUsd
+    ```
+
+    This is where a real protocol keeps the property that matters most. A lending pool's
+    health check compares two fields of an in-memory `AccountData` struct, and a withdrawal
+    check compares two locals — never two storage slots. A pass that required storage on
+    both sides was blind to precisely the core invariant of every protocol it looked at,
+    while faithfully reporting the configuration ranges around it.
+
+    The names are established, not guessed: a field is only read when its receiver is a
+    local declared in this body, and a bare identifier only when it is such a local. The
+    guard is quoted on the evidence, and the function it guards is the target — so an agent
+    receives the rule *and* the one place to go and check it.
+    """
+    by_function = {b.function_id: b for p in model.profiles for b in p.functions}
+    found: list[Invariant] = []
+
+    for relation in model.accounting.relations:
+        # Storage-keyed relations are handled by the passes above; this one is for the
+        # rules that have no storage to key on.
+        if relation.state_ids or relation.quantity_ids:
+            continue
+        if relation.kind not in (RelationKind.BOUND, RelationKind.EQUALITY):
+            continue
+
+        function_id = next(
+            (e.ref for e in relation.evidence if e.ref and "." in e.ref), ""
+        )
+        if not function_id:
+            continue
+
+        lowered = relation.expression.lower()
+        kind = (
+            InvariantKind.SOLVENCY
+            if any(term in lowered for term in _VALUE_TERMS)
+            else InvariantKind.ACCOUNTING
+        )
+        name = by_function[function_id].name if function_id in by_function else "it"
+        found.append(
+            _mint(
+                f"`{relation.expression}` must hold wherever {name} is reached; the "
+                "protocol reverts when it does not.",
+                kind,
+                [function_id],
+                list(relation.evidence[:2]),
+                expression=relation.expression,
+                breaks_if=[
+                    "a path reaches the state change without passing this check",
+                    "a value in the comparison can be moved after the check and before "
+                    "the write",
+                ],
                 holds_when=relation.holds_when,
             )
         )
@@ -494,6 +588,14 @@ def _bound_invariants(model: ProtocolModel) -> list[Invariant]:
             )
         )
     return found
+
+
+def _is_constant_cap(model: ProtocolModel, relation: AccountingRelation) -> bool:
+    """Whether the bounding side of this relation is a compile-time constant."""
+    if not relation.state_ids:
+        return False
+    item = next((s for s in model.state if s.id == relation.state_ids[0]), None)
+    return item is not None and (item.is_constant or item.is_immutable)
 
 
 def _literal_of(expression: str) -> tuple[str, str] | None:

@@ -10,9 +10,11 @@ import type {
   ApiError,
   BuildModel,
   CodeModel,
+  ContractMechanism,
   ContractProfile,
   GraphModel,
   IngestResponse,
+  MechanismIndex,
   ProfileIndexRow,
   ProtocolSummary,
 } from '../types/repo'
@@ -265,6 +267,29 @@ export async function fetchProfiles(runId: string): Promise<ProfileIndexRow[]> {
     `/audits/${runId}/protocol/profiles`,
   )
   return data.profiles
+}
+
+/**
+ * The per-contract mechanism index (schema 1.4).
+ *
+ * Derived from the semantic graph server-side, so the CLI, the API and this screen cannot
+ * disagree about what a contract does.
+ */
+export async function fetchMechanisms(runId: string): Promise<MechanismIndex> {
+  const { data } = await http.get<MechanismIndex>(`/audits/${runId}/protocol/mechanisms`)
+  return data
+}
+
+/** One contract's mechanism in full: every function's conditions, changes and calls. */
+export async function fetchMechanism(
+  runId: string,
+  contract: string,
+): Promise<ContractMechanism> {
+  const addressed = contract.split('/').map(encodeURIComponent).join('/')
+  const { data } = await http.get<ContractMechanism>(
+    `/audits/${runId}/protocol/mechanisms/${addressed}`,
+  )
+  return data
 }
 
 /**

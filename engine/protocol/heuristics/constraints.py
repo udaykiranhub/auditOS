@@ -100,6 +100,9 @@ class GuardRelation:
     """A literal multiplier on the bounding side, when there is exactly one: `2`."""
     literal: str = ""
     """The bounding side when it is a constant: `10000`. Mutually exclusive with `right`."""
+    left_terms: tuple[str, ...] = ()
+    """Readable names for the constrained side, whether or not they resolved to storage."""
+    right_terms: tuple[str, ...] = ()
     contract_id: str = ""
     function_id: str = ""
     operation_id: str = ""
@@ -170,9 +173,9 @@ def _key(relation: GuardRelation) -> str:
     # two halves of a range, not one rule seen twice.
     return "|".join(
         (
-            *relation.left,
+            *(relation.left or relation.left_terms),
             "::",
-            *relation.right,
+            *(relation.right or relation.right_terms),
             relation.kind,
             relation.operator,
             relation.literal,
@@ -268,6 +271,7 @@ def _read(
         return []
 
     parameters = frozenset(p.name for p in function.params if p.name)
+    locals_ = frozenset(_LOCAL.findall(function.raw))
 
     found: list[GuardRelation] = []
     for clause in inner.split("&&"):
@@ -282,8 +286,8 @@ def _read(
         if operator == "!=":
             continue
 
-        left = _operands(match.group("left"), scope, written, parameters)
-        right = _operands(match.group("right"), scope, written, parameters)
+        left = _operands(match.group("left"), scope, written, parameters, locals_)
+        right = _operands(match.group("right"), scope, written, parameters, locals_)
         if left is None or right is None:
             continue
 
@@ -301,6 +305,45 @@ class _Side:
     literal: str
     factor: str
     via_parameter: str
+    terms: tuple[str, ...] = ()
+    """Names this side denotes when they are *not* storage: `totalDebtUsd` from
+    `account.totalDebtUsd`, or a declared local. Populated alongside `items` when the side
+    mixes both, and alone when the side is entirely local."""
+
+    @property
+    def named(self) -> tuple[str, ...]:
+        return (*(item.name for item in self.items), *self.terms)
+
+
+#: `DataTypes.AccountData memory account = …` / `uint256 balance = …` — a local declaration.
+#: Only used to establish that an identifier is a local of *this* function, so that a guard
+#: mentioning it is a guard about something nameable rather than something unresolved.
+_LOCAL = re.compile(
+    r"^\s*(?:[A-Za-z_][\w.\[\]]*)\s+(?:memory|storage|calldata\s+)?\s*"
+    r"([a-z_]\w*)\s*=",
+    re.M,
+)
+
+#: `account.totalDebtUsd` — a field read off a local struct. The *field* is the name that
+#: carries the meaning; `account` is a temporary.
+_FIELD = re.compile(r"^([A-Za-z_]\w*)\.([A-Za-z_]\w*)$")
+
+#: Terms that read as an amount of value rather than an index, id or flag. Used only to pick
+#: the invariant's *kind*, never to decide whether the relation exists.
+_VALUE_TERMS = (
+    "debt",
+    "collateral",
+    "borrow",
+    "supply",
+    "balance",
+    "liquidity",
+    "limit",
+    "amount",
+    "shares",
+    "assets",
+    "value",
+    "usd",
+)
 
 
 def _operands(
@@ -308,6 +351,7 @@ def _operands(
     scope: _Scope,
     written: dict[str, StateItem],
     parameters: frozenset[str],
+    locals_: frozenset[str],
 ) -> _Side | None:
     """Classify one side, or `None` when it contains something unrecognised.
 
@@ -330,6 +374,23 @@ def _operands(
 
     if _LITERAL.match(text.replace(" ", "")):
         return _Side((), text.replace("_", "").replace(" ", ""), "", "")
+
+    # `account.totalDebtUsd` — a field read off a local struct. This is where a real
+    # protocol keeps the quantities its core invariants are about: the health check in a
+    # lending pool compares two fields of an in-memory `AccountData`, never two storage
+    # slots. Requiring storage on both sides made the pass blind to exactly the rule that
+    # matters most. The receiver must be a declared local of this function, so the name is
+    # established rather than assumed.
+    field = _FIELD.match(text)
+    if field is not None and field.group(1) in locals_:
+        return _Side((), "", "", "", (field.group(2),))
+
+    # A bare local: `if (withdrawAmount > balance) revert`. Both names are declared in this
+    # body, so the rule "a withdrawal may not exceed the balance" is nameable and quoted
+    # even though neither side is a storage slot. Restricted to *declared* locals — an
+    # unknown identifier is still refused.
+    if text in locals_:
+        return _Side((), "", "", "", (text,))
 
     items: list[StateItem] = []
     factor = ""
@@ -376,28 +437,30 @@ def _relate(
     # Orientation is decided by which side names storage, not by the operator. Mirroring
     # unconditionally on `<`/`<=` moved the constrained variable onto the empty side of
     # `cutoffTime <= 64800` and dropped the whole upper half of every configured range.
-    if not left.items and right.items:
+    if not left.named and right.named:
         left, right = right, left
         operator = _MIRROR[operator]
-    elif left.items and right.items and operator in ("<", "<="):
+    elif left.named and right.named and operator in ("<", "<="):
         # Both sides name storage, so either reading is valid; normalise to the `>=` form
         # so `a <= b` and `b >= a` produce one record rather than two.
         left, right = right, left
         operator = _MIRROR[operator]
 
-    if not left.items:
-        # Both sides were literals. Nothing about this protocol's storage is being said.
+    if not left.named:
+        # Neither side named anything. Nothing about this protocol is being said.
         return None
 
     kind = RelationKind.EQUALITY if operator == "==" else RelationKind.BOUND
-    if not right.items and not right.literal:
+    if not right.named and not right.literal:
         return None
-    if {item.id for item in left.items} == {item.id for item in right.items}:
+    if left.named == right.named:
         return None
 
     return GuardRelation(
         left=tuple(item.id for item in left.items),
         right=tuple(item.id for item in right.items),
+        left_terms=left.named,
+        right_terms=right.named,
         kind=kind,
         expression=expression[:200],
         operator=operator,
@@ -417,9 +480,13 @@ def _rule_text(relation: GuardRelation, names: dict[str, str]) -> str:
     the raw text would contradict it. The verbatim guard is not lost — it is the evidence
     excerpt on this relation, which is where a quotation belongs.
     """
-    left = " + ".join(names.get(i, i) for i in relation.left)
-    if relation.right:
-        right = " + ".join(names.get(i, i) for i in relation.right)
+    left = " + ".join(relation.left_terms) or " + ".join(
+        names.get(i, i) for i in relation.left
+    )
+    if relation.right_terms or relation.right:
+        right = " + ".join(relation.right_terms) or " + ".join(
+            names.get(i, i) for i in relation.right
+        )
         if relation.factor:
             right = f"{right} * {relation.factor}"
     else:
@@ -435,7 +502,8 @@ def _as_accounting_relation(
         # `cutoffTime <= 64800` constrain one variable and are two distinct rules.
         id=make_relationship_id(
             f"{relation.kind.value}{relation.operator}{relation.literal}",
-            list(relation.state_ids),
+            list(relation.state_ids)
+            or [relation.function_id, *relation.left_terms, *relation.right_terms],
         ),
         kind=relation.kind,
         expression=_rule_text(relation, names),

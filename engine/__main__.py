@@ -313,7 +313,7 @@ def _cmd_protocol(args: argparse.Namespace) -> int:
 
     code, _ = parse_and_save(repo, run_dir, build)
     graph, _ = build_and_save_graph(code, run_dir)
-    model = understand(code, graph, repo)
+    model = understand(code, graph, repo, build, run_dir)
 
     if args.enrich:
         from engine.protocol.enrich import default_provider, enrich

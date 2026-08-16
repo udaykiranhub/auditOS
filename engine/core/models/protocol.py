@@ -42,6 +42,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 from engine.core.models.evidence import Claim, Confidence, Evidence, EvidenceKind
+from engine.core.models.semantic import SemanticGraph
 
 # 1.1: semantic-quality refinement.
 #   + Confidence.UNKNOWN — an absence is no longer indistinguishable from an observation
@@ -71,7 +72,7 @@ from engine.core.models.evidence import Claim, Confidence, Evidence, EvidenceKin
 #     string; an agent needs them one at a time, because each is a separate thing to check
 #   + Operation.postconditions now populated — preconditions without postconditions is half
 #     a contract per function, and the other half was a re-read of the body away
-SCHEMA_VERSION = "1.3.0"
+SCHEMA_VERSION = "1.4.0"
 
 ARTIFACT_NAME = "protocol"
 
@@ -949,6 +950,17 @@ class SurfaceKind(StrEnum):
     CENTRALIZATION = "centralization"
     UPGRADE = "upgrade"
 
+    # Graph-derived (schema 1.4). These exist because a *pattern over this protocol*
+    # matched, not because an operation had a conventional name.
+    REENTRANCY = "reentrancy"
+    """A state write positioned after a call that leaves the frame."""
+
+    ACCESS_CONTROL = "access_control"
+    """Value moves along a path with no comparison guarding it."""
+
+    STATE_SYNC = "state_sync"
+    """A rule whose two sides are owned by different contracts."""
+
 
 class SurfaceDomain(StrEnum):
     """What *kind of reasoning* a surface calls for — deliberately not which agent runs.
@@ -970,6 +982,8 @@ class SurfaceDomain(StrEnum):
     INCENTIVES = "incentives"
     LIQUIDITY = "liquidity"
     ORDERING = "ordering"
+    REENTRANCY = "reentrancy"
+    GOVERNANCE = "governance"
     """Outcome depends on transaction or call ordering — MEV, front-running, CEI."""
 
 
@@ -1750,6 +1764,14 @@ class ProtocolModel(BaseModel):
     assumptions: list[Assumption] = Field(default_factory=list)
     invariants: list[Invariant] = Field(default_factory=list)
     risk_surfaces: list[RiskSurface] = Field(default_factory=list)
+
+    # 12a — the semantic graph (schema 1.4)
+    semantic: SemanticGraph = Field(default_factory=SemanticGraph)
+    """Contracts, functions, storage, struct fields and locals, with typed relations
+    between them — read from the solc AST the build stage writes. This is what makes a
+    downstream answer a *query over this protocol* rather than a lookup in a table keyed
+    by operation name, which is why two protocols with a `deposit` no longer receive
+    identical output. Empty at text fidelity; `semantic.fidelity` says which."""
 
     # 16 — the contract-level view (schema 1.2)
     profiles: list[ContractProfile] = Field(default_factory=list)

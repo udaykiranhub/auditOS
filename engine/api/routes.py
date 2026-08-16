@@ -22,6 +22,8 @@ GET  /audits/{run_id}/protocol      the persisted ProtocolModel
 GET  /audits/{run_id}/protocol/summary   the overview, without the megabytes
 GET  /audits/{run_id}/protocol/profiles  one line per contract
 GET  /audits/{run_id}/protocol/profiles/{contract}  one contract, in full
+GET  /audits/{run_id}/protocol/mechanisms   per-contract: conditions, state changes, calls
+GET  /audits/{run_id}/protocol/mechanisms/{contract}  one contract's mechanism
 ```
 """
 
@@ -60,6 +62,7 @@ from engine.parse.pipeline import ARTIFACT_NAME as CODE_ARTIFACT
 from engine.parse.pipeline import parse_and_save
 from engine.protocol.assemble import finalize as finalize_protocol
 from engine.protocol.assemble import save as save_protocol
+from engine.protocol.semantic import mechanism
 from engine.protocol.understand import understand
 
 # Matches MAX_ARCHIVE_ENTRIES in ingest/materialize.py — an upload is a repo either way.
@@ -519,7 +522,7 @@ def protocol(run_id: str, request: ProtocolRequest | None = None) -> ProtocolMod
     repo = _load_repo(run_id)
 
     try:
-        model = understand(code, graph, repo)
+        model = understand(code, graph, repo, _load_build(run_id), run_dir)
     except FatalError as exc:
         raise _fatal(exc) from exc
 
@@ -654,6 +657,62 @@ def protocol_summary(run_id: str) -> dict[str, Any]:
     }
 
 
+@app.get("/audits/{run_id}/protocol/mechanisms")
+def protocol_mechanisms(run_id: str) -> dict[str, Any]:
+    """Every contract as its mechanism: what each function checks, changes and calls.
+
+    Computed from the semantic graph server-side so the CLI, the API and the UI cannot
+    disagree about what a contract does. The whole set for a real repository is large, so
+    the index carries counts and `/mechanisms/{contract}` carries one contract in full.
+    """
+    model = get_protocol(run_id)
+    found = mechanism.contracts(model.semantic)
+    return {
+        "fidelity": model.semantic.fidelity.value,
+        "notes": model.semantic.notes,
+        "counts": model.semantic.counts,
+        "contracts": [
+            {
+                "name": item.name,
+                "contract_id": item.contract_id,
+                "path": item.path,
+                "kind": item.kind,
+                "inherits": item.inherits,
+                "functions": len(item.functions),
+                "entrypoints": item.entrypoints,
+                "state": len(item.state),
+                "relationships": len(item.relationships),
+                "conditions": sum(len(f.conditions) for f in item.functions),
+                "state_changes": sum(len(f.state_changes) for f in item.functions),
+            }
+            for item in found
+        ],
+    }
+
+
+@app.get("/audits/{run_id}/protocol/mechanisms/{contract:path}")
+def protocol_mechanism(run_id: str, contract: str) -> dict[str, Any]:
+    """One contract in full, addressed by `SolidityID` or by bare name."""
+    model = get_protocol(run_id)
+    found = mechanism.contracts(model.semantic)
+    match = next(
+        (m for m in found if contract in (m.contract_id, m.name)),
+        None,
+    )
+    if match is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": f"Run {run_id} has no mechanism for {contract!r}.",
+                "hint": (
+                    f"GET /audits/{run_id}/protocol/mechanisms lists them. An empty list "
+                    "means the repository did not compile, so no AST was available."
+                ),
+            },
+        )
+    return match.model_dump(mode="json")
+
+
 @app.get("/audits/{run_id}/protocol/profiles")
 def protocol_profiles(run_id: str) -> dict[str, Any]:
     """One line per contract: enough to render a list, not enough to be megabytes.
@@ -735,6 +794,21 @@ def _quantity_name(model: ProtocolModel, quantity_id: str) -> str:
         (q for q in model.accounting.quantities if q.id == quantity_id), None
     )
     return found.name if found is not None else quantity_id.rpartition("#")[2]
+
+
+def _load_build(run_id: str) -> BuildModel | None:
+    """The `BuildModel`, when this run was compiled. `None` is normal, not an error.
+
+    It exists to locate the solc ASTs the semantic graph reads. A run that was never built
+    has none, and the graph degrades to text fidelity rather than the request failing.
+    """
+    artifact = default_run_root() / run_id / "artifacts" / f"{BUILD_ARTIFACT}.json"
+    if not artifact.is_file():
+        return None
+    try:
+        return load_artifact(BuildModel, artifact)
+    except (OSError, ValueError):
+        return None
 
 
 def _load_repo(run_id: str) -> RepoModel:

@@ -510,6 +510,87 @@ export interface EnrichmentRow {
   notes: string[]
 }
 
+// ── The semantic graph (schema 1.4) ───────────────────────────────────────────
+
+/** One state write, with its direction. `totalDeposits += amount`, not "writes it". */
+export interface StateChange {
+  variable: string
+  expression: string
+  /** increase | decrease | set | scale */
+  effect: string
+  order: number
+}
+
+/** One function, as the questions an auditor asks of it. */
+export interface FunctionMechanism {
+  name: string
+  qualified_name: string
+  solidity_id: string
+  visibility: string
+  mutability: string
+  is_entrypoint: boolean
+  modifier_count: number
+  /**
+   * Comparisons that must hold to proceed, normalised — an `if (…) revert` appears as the
+   * rule it establishes, not as the condition that triggers the revert.
+   */
+  conditions: string[]
+  state_changes: StateChange[]
+  reads: string[]
+  internal_calls: string[]
+  /** Calls that hand control outside this contract. Where reentrancy questions start. */
+  external_calls: string[]
+  /** State written after control first left. A candidate to check, not a verdict. */
+  writes_after_external_call: string[]
+}
+
+/** `deposits ──must cover 2×──▶ debt`, read off a condition the protocol enforces. */
+export interface MechanismRelationship {
+  left: string
+  right: string
+  operator: string
+  rule: string
+  enforced_in: string
+}
+
+export interface ContractMechanism {
+  name: string
+  contract_id: string
+  path: string
+  kind: string
+  inherits: string[]
+  state: { name: string; type: string; visibility: string }[]
+  functions: FunctionMechanism[]
+  relationships: MechanismRelationship[]
+  depends_on: string[]
+}
+
+/** A row of `GET /protocol/mechanisms` — the contract picker. */
+export interface MechanismRow {
+  name: string
+  contract_id: string
+  path: string
+  kind: string
+  inherits: string[]
+  functions: number
+  entrypoints: number
+  state: number
+  relationships: number
+  conditions: number
+  state_changes: number
+}
+
+export interface MechanismIndex {
+  /**
+   * `ast` when the repository compiled and the graph was read from real expression trees;
+   * `text` when it did not, in which case an absent relation means "not visible".
+   */
+  fidelity: 'ast' | 'text' | 'mixed'
+  notes: string[]
+  counts: Record<string, number>
+  contracts: MechanismRow[]
+}
+
 /** One ordered effect in a function body. The order is what reentrancy questions read. */
 export interface FunctionStep {
   order: number

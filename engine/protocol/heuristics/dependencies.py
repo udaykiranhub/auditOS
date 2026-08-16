@@ -255,7 +255,37 @@ def _looks_external(
     if variable is None:
         return False
     # A handle typed as a contract we audit is an internal reference, not a dependency.
-    return not any(variable.type.strip("[]") in cid for cid in audited)
+    if any(variable.type.strip("[]") in cid for cid in audited):
+        return False
+    # Only a *contract-typed* handle can be an external system. `_reservesList` is an
+    # `address[]` and `_assets` a mapping; calling `.length` or `.push` on one made both
+    # appear in the model as external systems the protocol's correctness depends on, beside
+    # the real ones. A collection is storage, and storage is not a counterparty.
+    return _is_contract_typed(index, variable.type)
+
+
+def _is_contract_typed(index: ProtocolIndex, type_name: str) -> bool:
+    """Whether a declared type names a contract or interface rather than data.
+
+    Structural: the type must resolve to something declared in the repository, or be an
+    unknown capitalised identifier — which is how an interface imported from a dependency
+    looks. Arrays, mappings and elementary types are none of those.
+    """
+    bare = type_name.strip()
+    if bare.startswith("mapping") or bare.endswith("]") or "=>" in bare:
+        return False
+    if bare in _ELEMENTARY or bare.startswith(("uint", "int", "bytes")):
+        return False
+    head = bare.partition(" ")[0]
+    if not head or not head[0].isupper():
+        return False
+    return True
+
+
+#: Value types that are never a counterparty, however they are called.
+_ELEMENTARY = frozenset(
+    {"address", "address payable", "bool", "string", "bytes", "byte"}
+)
 
 
 def _classify(name: str) -> tuple[DependencyKind, tuple[str, ...]]:
