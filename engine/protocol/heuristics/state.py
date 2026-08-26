@@ -38,7 +38,9 @@ from engine.core.models.protocol import (
     StateTransition,
     TransitionEffect,
 )
+from engine.core.models.semantic import SemanticGraph
 from engine.protocol.heuristics.signatures import ProtocolIndex
+from engine.protocol.heuristics.state_roles import RoleInference
 from engine.protocol.ids import make_state_id, make_transition_id
 
 DETECTOR = "state_model"
@@ -84,6 +86,13 @@ ROLE_BY_NAME: tuple[tuple[str, StateRole], ...] = (
     ("deadline", StateRole.TIMESTAMP),
     ("lastupdate", StateRole.TIMESTAMP),
     ("periodfinish", StateRole.TIMESTAMP),
+    ("threshold", StateRole.THRESHOLD),
+    ("cap", StateRole.THRESHOLD),
+    ("maxi", StateRole.THRESHOLD),
+    ("limit", StateRole.THRESHOLD),
+    ("name", StateRole.METADATA),
+    ("symbol", StateRole.METADATA),
+    ("decimals", StateRole.METADATA),
     ("allowance", StateRole.CONFIG),
     ("cached", StateRole.CACHE),
 )
@@ -114,12 +123,23 @@ def detect(
     index: ProtocolIndex,
     classifications: list[ContractClassification],
     assets: list[Asset],
+    graph: SemanticGraph | None = None,
+    operations: list[Operation] | None = None,
 ) -> list[StateItem]:
-    """One item per state variable on a classified contract, with its meaning and users."""
+    """One item per state variable on a classified contract, with its meaning and users.
+
+    `graph` and `operations` are optional and together turn role inference from a lookup in
+    a name table into a vote across the declared type, the direction of every write, the
+    operation that performs it, what constrains it and what it flows from. Without them the
+    name table still runs, which is what a repository that did not compile gets.
+    """
     asset_by_var = {
         state_var_id: asset.id for asset in assets for state_var_id in asset.state_var_ids
     }
     admin_writers = _admin_only_writers(index)
+    inference = (
+        RoleInference(graph, operations or []) if graph is not None and graph.edges else None
+    )
 
     items: list[StateItem] = []
     for classification in classifications:
@@ -128,7 +148,9 @@ def detect(
             continue
         for variable in contract.state_vars:
             items.append(
-                _build(index, variable, classification, asset_by_var, admin_writers)
+                _build(
+                    index, variable, classification, asset_by_var, admin_writers, inference
+                )
             )
     return items
 
@@ -139,8 +161,15 @@ def _build(
     classification: ContractClassification,
     asset_by_var: dict[str, str],
     admin_writers: set[str],
+    inference: RoleInference | None = None,
 ) -> StateItem:
-    role = _role_of(variable)
+    named = _role_of(variable)
+    verdict = (
+        inference.classify(variable, variable.id, named)
+        if inference is not None
+        else None
+    )
+    role = verdict.role if verdict is not None else named
     writers = index.query.writers_of(variable.id)
     readers = index.query.readers_of(variable.id)
 
@@ -156,7 +185,11 @@ def _build(
         graph_evidence(writer, "writes", variable.id, detector=DETECTOR)
         for writer in writers[:3]
     )
-    if role is not StateRole.UNKNOWN:
+    if verdict is not None:
+        # The multi-signal path carries its own evidence — which signals fired, and what
+        # each of them read. That is strictly more than "the name suggested it".
+        evidence.extend(verdict.evidence)
+    elif role is not StateRole.UNKNOWN:
         evidence.append(
             heuristic_evidence(DETECTOR, f"name suggests {role.value}", ref=variable.id)
         )
@@ -403,3 +436,51 @@ __all__ = [
     "detect",
     "transitions",
 ]
+
+
+def refine_roles(
+    items: list[StateItem],
+    graph: SemanticGraph,
+    operations: list[Operation],
+) -> None:
+    """Second pass, once operations exist, using the one signal the first pass could not.
+
+    Which *protocol operation* writes a variable is what separates a debt record from a
+    balance — the two have identical types and often similar names, and only the operation
+    that moves them tells them apart. Operations are classified after state, so this runs
+    afterwards and upgrades in place.
+
+    Only ever upgrades: a role the first pass reached `DERIVED` on is left alone, because
+    the earlier signals were structural and this one is weaker than all of them.
+    """
+    if not graph.edges or not operations:
+        return
+    inference = RoleInference(graph, operations)
+
+    for item in items:
+        if item.confidence.rank >= Confidence.DERIVED.rank:
+            continue
+        variable = _as_state_var(item)
+        verdict = inference.classify(variable, item.state_var_id, item.role)
+        if verdict.role is StateRole.UNKNOWN:
+            continue
+        if verdict.confidence.rank <= item.confidence.rank and item.role is not StateRole.UNKNOWN:
+            continue
+        item.role = verdict.role
+        item.confidence = verdict.confidence
+        item.meaning = _meaning(variable, verdict.role)
+        for evidence in verdict.evidence:
+            if evidence not in item.evidence:
+                item.evidence.append(evidence)
+
+
+def _as_state_var(item: StateItem) -> StateVar:
+    """The declaration behind a `StateItem`, for a signal that needs the raw shape."""
+    return StateVar(
+        id=item.state_var_id,
+        contract_id=item.contract_id,
+        name=item.name,
+        type=item.type,
+        is_constant=item.is_constant,
+        is_immutable=item.is_immutable,
+    )

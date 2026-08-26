@@ -408,3 +408,40 @@ def index_of(tmp_path):
         return ProtocolIndex(code, graph)
 
     return factory
+
+
+@pytest.fixture
+def understand_with_ast(tmp_path):
+    """`understand_with_ast(SOURCES)` → a ProtocolModel built *with* the solc AST.
+
+    Compiles for real, because the signals this exercises — the direction of a write, what
+    constrains a variable, what a value derives from — exist only in the compiler's output.
+    A hand-built AST would test the reader against a shape we invented rather than the one
+    solc emits.
+
+    Skipped rather than failed where no toolchain is present: the engine is designed to
+    degrade to text fidelity without one, and a missing `forge` is an environment fact, not
+    a defect in the code under test.
+    """
+    import shutil
+
+    if shutil.which("forge") is None:
+        pytest.skip("forge is not on PATH; the AST-backed signals cannot be exercised")
+
+    from pathlib import Path
+
+    from engine.ingest.build.pipeline import build_and_save
+    from engine.protocol.understand import understand
+
+    counter = {"n": 0}
+
+    def factory(sources: dict[str, str]):
+        counter["n"] += 1
+        name = f"ast{counter['n']}"
+        code, graph, repo = build_from_sources(tmp_path, sources, name=name)
+        run_dir = Path(tmp_path) / f"{name}-run" / "run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        build, _ = build_and_save(repo, run_dir)
+        return understand(code, graph, repo, build, run_dir)
+
+    return factory

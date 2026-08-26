@@ -121,6 +121,14 @@ def understand(
 
     index = ProtocolIndex(code, graph)
     model = new_model(repo, code, graph)
+
+    # ── 0. The semantic graph, from the AST the build stage already wrote ─────
+    # First, not twelfth. It depends only on the AST and `CodeModel`, and every later
+    # stage is better for having it: state roles are decided by voting across the
+    # declared type, the direction of each write and what constrains a variable, none of
+    # which exists without this. Built at stage 12 it was ready too late to inform the
+    # stage that needed it most.
+    model.semantic = semantic_stage.build(solc_ast.load(build, run_dir), code)
     model.identity = _identity(repo, code, index)
 
     # ── 3 → 2 → 1. Standards first: a confirmed ERC-4626 is the strongest role signal ──
@@ -140,7 +148,9 @@ def understand(
     model.assets = assets_stage.detect(index, model.contracts, model.standards)
 
     # ── 9. State — before operations, which reference state items ─────────────
-    model.state = state_stage.detect(index, model.contracts, model.assets)
+    model.state = state_stage.detect(
+        index, model.contracts, model.assets, model.semantic
+    )
 
     # ── 8. Operations, then 7 flows and 10 transitions hung off them ──────────
     model.operations = operations_stage.detect(
@@ -150,18 +160,17 @@ def understand(
     model.state_transitions = state_stage.transitions(index, model.operations, model.state)
     operations_stage.link(model.operations, model.asset_flows, model.state_transitions)
 
+    # Now that operations are classified, the one role signal unavailable at stage 9 —
+    # *which operation writes this* — can settle the variables the others left open.
+    # It is what separates a debt record from a balance: identical types, similar names,
+    # and only the operation moving them tells them apart.
+    state_stage.refine_roles(model.state, model.semantic, model.operations)
+
     model.entrypoints = sorted({o.function_id for o in model.operations})
     model.privileged = sorted({o.function_id for o in model.operations if o.is_privileged})
 
     # ── 11. External dependencies ─────────────────────────────────────────────
     model.dependencies = dependencies_stage.detect(index, model.contracts)
-
-    # ── 12a. The semantic graph, from the AST the build stage already wrote ───
-    # Runs before accounting because everything downstream should eventually be a
-    # *query* over this graph rather than a lookup in a table keyed by operation name.
-    # A table gives two protocols with a `deposit` identical output; a graph gives each
-    # the answer its own code supports.
-    model.semantic = semantic_stage.build(solc_ast.load(build, run_dir), code)
 
     # ── 12–13. Accounting, then the economics built on it ─────────────────────
     # `guards` are the relations the protocol *enforces* — read out of its own require

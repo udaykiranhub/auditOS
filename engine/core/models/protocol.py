@@ -742,6 +742,39 @@ class StateRole(StrEnum):
     FLAG = "flag"  # paused, initialized
     LOCK = "lock"  # reentrancy guard
     CACHE = "cache"
+
+    # Schema 1.4. Every one of these was previously `unknown` — not because the code was
+    # unclear, but because the vocabulary had no word for it. On a real protocol these
+    # kinds are the majority of storage: a lending pool is mostly record stores and
+    # indexes, and reporting them all as "role unclear" made the model look blind to its
+    # own subject.
+    RECORD_STORE = "record_store"
+    """`mapping(key => Struct)` — the protocol's own bookkeeping. `_reserves`,
+    `_transfers`, `_feeds`. Corrupting one is an accounting bug, not a balance bug."""
+
+    POSITION = "position"
+    """A per-account record of what someone holds and owes, usually a struct behind one
+    or two address keys. The unit a lending or perps protocol reasons about."""
+
+    INDEX_LIST = "index_list"
+    """`mapping(key => T[])` or a bare array used to enumerate. Growth is the risk here
+    — an unbounded list is a gas-exhaustion surface, not an accounting one."""
+
+    MEMBERSHIP = "membership"
+    """`mapping(key => bool)` used as a set. An allowlist, a listed-asset marker."""
+
+    COUNTER = "counter"
+    """A monotonically increasing id or sequence. Distinct from `NONCE`, which exists to
+    prevent replay; a counter exists to name things."""
+
+    THRESHOLD = "threshold"
+    """A bound the protocol compares against: a staleness window, a close factor, a
+    cap. What "is this parameter bounded?" is a question about."""
+
+    METADATA = "metadata"
+    """`name`, `symbol`, `decimals`, a URI. Never load-bearing for correctness, and
+    saying so keeps it out of every accounting question."""
+
     UNKNOWN = "unknown"
 
 

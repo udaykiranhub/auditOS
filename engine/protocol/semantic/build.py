@@ -322,8 +322,9 @@ class _Builder:
             if kind == "Assignment":
                 order += 1
                 target = inner.get("leftHandSide") or {}
-                effect = _EFFECT.get(inner.get("operator", "="), "set")
-                right = solc_ast._text(inner.get("rightHandSide") or {})
+                right_node = inner.get("rightHandSide") or {}
+                effect = _effect_of(inner.get("operator", "="), right_node)
+                right = solc_ast._text(right_node)
                 for declaration in solc_ast._referenced(target):
                     node_id = self._touch(declaration, source)
                     if node_id is None:
@@ -354,6 +355,29 @@ class _Builder:
                                 confidence=Confidence.DERIVED,
                                 ref=self._nodes[function].solidity_id,
                             )
+
+            elif kind == "UnaryOperation" and inner.get("operator") in ("++", "--"):
+                # `nextTransferId++` is a state write, and the only one for a counter. It
+                # is a `UnaryOperation`, not an `Assignment`, so a pass that looked only at
+                # assignments recorded no writer at all — leaving every id counter in the
+                # protocol with no direction, no writer and therefore no role.
+                order += 1
+                operand = inner.get("subExpression") or {}
+                increments = inner.get("operator") == "++"
+                for declaration in solc_ast._referenced(operand):
+                    node_id = self._touch(declaration, source)
+                    if node_id is None:
+                        continue
+                    self._link(
+                        function,
+                        node_id,
+                        EdgeKind.WRITES,
+                        detail=f"{solc_ast._text(operand)}{inner.get('operator')}",
+                        operator="increase" if increments else "decrease",
+                        order=order,
+                        confidence=Confidence.DERIVED,
+                        ref=self._nodes[function].solidity_id,
+                    )
 
             elif kind in ("Identifier", "MemberAccess"):
                 referenced = inner.get("referencedDeclaration")
@@ -539,6 +563,24 @@ class _Builder:
             if ref
             else [],
         )
+
+
+def _effect_of(operator: str, right: dict[str, Any]) -> str:
+    """What an assignment does to the quantity on the left.
+
+    `+=` and `-=` say it outright. A plain `=` usually does not — but
+    `balanceOf[from] = balance - amount` is a decrease, and reading it as a replacement made
+    every solmate-style ERC20 balance look like a value that only ever rises. The direction
+    is in the arithmetic on the right, so that is where it is read from.
+    """
+    if operator in _EFFECT and operator != "=":
+        return _EFFECT[operator]
+    if right.get("nodeType") == "BinaryOperation":
+        if right.get("operator") == "-":
+            return "decrease"
+        if right.get("operator") == "+":
+            return "increase"
+    return "set"
 
 
 def _children(container: dict[str, Any], node_type: str) -> list[dict[str, Any]]:
